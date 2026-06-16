@@ -1,4 +1,3 @@
-// ==================== 常量配置 ====================
 const CONSTANTS = {
     ELECTRICITY: {
         MIN_VALUE: 0,
@@ -13,14 +12,11 @@ const CONSTANTS = {
         CONTINUOUS_DAY_THRESHOLD: 1.5
     },
     CHART: {
-        ANIMATION_DURATION: 1000,
         DEFAULT_ZOOM_DELTA: 10
     }
 };
 
-// ==================== 工具函数 ====================
 
-// 验证工具函数
 const ValidationUtils = {
     isValidNumber(value, min = -Infinity, max = Infinity) {
         return typeof value === 'number' &&
@@ -36,7 +32,7 @@ const ValidationUtils = {
 
     isValidTimeString(timeStr) {
         return typeof timeStr === 'string' &&
-               /^\d{1,2}-\d{1,2}(\s+\d{1,2}:\d{1,2})?/.test(timeStr);
+               /^\d{1,2}-\d{1,2}(\s+\d{1,2}:\d{1,2}(:\d{1,2})?)?$/.test(timeStr.trim());
     },
 
     sanitizeElectricityValue(value) {
@@ -48,7 +44,6 @@ const ValidationUtils = {
     }
 };
 
-// 数学运算安全工具
 const MathUtils = {
     safeDivide(numerator, denominator, fallback = 0) {
         if (!ValidationUtils.isValidNumber(numerator) ||
@@ -57,14 +52,6 @@ const MathUtils = {
             return fallback;
         }
         return numerator / denominator;
-    },
-
-    safeAverage(values, fallback = 0) {
-        if (!ValidationUtils.isValidArray(values, 1)) return fallback;
-        const validValues = values.filter(v => ValidationUtils.isValidNumber(v));
-        if (validValues.length === 0) return fallback;
-        const sum = validValues.reduce((acc, val) => acc + val, 0);
-        return this.safeDivide(sum, validValues.length, fallback);
     },
 
     clamp(value, min, max) {
@@ -87,35 +74,10 @@ const MathUtils = {
     }
 };
 
-// 错误处理工具
-const ErrorHandler = {
-    handleDataLoadError(error, context = '数据加载') {
-        console.error(`${context}错误:`, error);
-        showToast(`${context}失败: ${error.message || '未知错误'}`, 'error');
-    },
-
-    handleChartError(error, chartName = '图表') {
-        console.error(`${chartName}渲染错误:`, error);
-        showToast(`${chartName}渲染失败`, 'error');
-    },
-
-    withErrorHandling(fn, context = '操作') {
-        return async (...args) => {
-            try {
-                return await fn(...args);
-            } catch (error) {
-                this.handleDataLoadError(error, context);
-                return null;
-            }
-        };
-    }
-};
-// ==================== 主题系统 ====================
 const themeToggle = document.getElementById('theme-toggle');
 const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 let isDark = localStorage.getItem('theme') === 'dark' || (localStorage.getItem('theme') === null && prefersDark);
 
-// 图表变量先声明
 let chartLight = null;
 let chartAc = null;
 
@@ -134,19 +96,21 @@ themeToggle.addEventListener('click', () => {
     showToast(isDark ? '已切换到深色模式' : '已切换到浅色模式');
 });
 
-// ==================== Toast 通知 ====================
+let toastTimer = null;
+
 function showToast(message, type = 'info') {
     const toast = document.getElementById('toast');
     toast.textContent = message;
     toast.className = `toast toast-${type} show`;
-    setTimeout(() => toast.classList.remove('show'), 3000);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), 3000);
 }
 
-// ==================== 图表初始化 ====================
 chartLight = echarts.init(document.getElementById('chart-light'));
 chartAc = echarts.init(document.getElementById('chart-ac'));
 let currentChartType = 'area';
 let rawData = [];
+let currentDataMonth = null;
 
 function getChartColors() {
     const style = getComputedStyle(document.documentElement);
@@ -281,13 +245,12 @@ function getChartOption(title, color, gradientColors, data, type = 'line') {
 
 function updateChartsTheme() {
     if (rawData.length > 0) {
-        renderCharts(rawData, currentChartType);
+        renderCharts(rawData, currentChartType, currentDataMonth);
     }
 }
 
-// ==================== 数据处理 ====================
 function interpolateMissingData(dataArray) {
-    const processed = [...dataArray];
+    const processed = dataArray.map(record => ({ ...record }));
     ['light_Balance', 'ac_Balance'].forEach(field => {
         for (let i = 0; i < processed.length; i++) {
             if (processed[i][field] == null) {
@@ -311,45 +274,83 @@ function interpolateMissingData(dataArray) {
     return processed;
 }
 
-function getStatus(value) {
-    if (value > CONSTANTS.ELECTRICITY.SUFFICIENT_THRESHOLD) return { text: '充足', class: 'status-good', percent: 100 };
-    if (value > CONSTANTS.ELECTRICITY.LOW_THRESHOLD) return { text: '偏低', class: 'status-warning', percent: Math.min(value, 100) };
-    return { text: '不足', class: 'status-danger', percent: value };
+function getElectricityStatus(value, fullReference = CONSTANTS.ELECTRICITY.SUFFICIENT_THRESHOLD) {
+    const normalizedValue = ValidationUtils.sanitizeElectricityValue(value);
+    // 进度条按“相对历史最高余额”显示充盈度，而非把度数硬当百分比（基准不再拍脑袋）。
+    const reference = fullReference > 0 ? fullReference : CONSTANTS.ELECTRICITY.SUFFICIENT_THRESHOLD;
+    const percent = MathUtils.clamp((normalizedValue / reference) * 100, 0, 100);
+
+    if (normalizedValue > CONSTANTS.ELECTRICITY.SUFFICIENT_THRESHOLD) {
+        return { state: 'good', label: '充足', percent };
+    }
+    if (normalizedValue > CONSTANTS.ELECTRICITY.LOW_THRESHOLD) {
+        return { state: 'warning', label: '偏低', percent };
+    }
+    return { state: 'danger', label: '不足', percent };
 }
 
-// 解析时间字符串，支持跨年 (格式: "MM-DD HH:mm")
-function parseTimeString(timeStr) {
+function setElectricityStatus(statusEl, progressEl, status) {
+    statusEl.textContent = status.label;
+    statusEl.dataset.state = status.state;
+    statusEl.setAttribute('aria-label', status.label);
+    progressEl.style.setProperty('--progress', `${status.percent}%`);
+}
+
+function getTrendState(value) {
+    const numericValue = Number(value);
+    if (numericValue > 0) return 'down';
+    if (numericValue < 0) return 'up';
+    return 'flat';
+}
+
+function formatConsumptionDelta(value) {
+    const numericValue = Number(value);
+    const safeValue = ValidationUtils.isValidNumber(numericValue) ? numericValue : 0;
+    const sign = safeValue >= 0 ? '-' : '+';
+    return `${sign}${Math.abs(safeValue).toFixed(1)}`;
+}
+
+function setConsumptionTrend(trendEl, value) {
+    trendEl.dataset.trend = getTrendState(value);
+    trendEl.querySelector('.trend-value').textContent = formatConsumptionDelta(value);
+}
+
+function getMonthContext(value) {
+    return /^\d{4}-\d{2}$/.test(value) ? value : null;
+}
+
+function getRecordMonthContext(record, fallbackMonth = null) {
+    return getMonthContext(record.month || '') || fallbackMonth;
+}
+
+function parseTimeString(timeStr, monthContext = null) {
     try {
-        // 验证输入
         if (!ValidationUtils.isValidTimeString(timeStr)) {
             console.warn(`无效的时间格式: ${timeStr}`);
-            return new Date(); // 返回当前时间作为fallback
+            return new Date(); // 返回当前时间作为兜底值。
         }
+
+        const normalizedTime = timeStr.trim();
+        const [datePart, clockPart = '00:00'] = normalizedTime.split(/\s+/);
+        const [monthText, dayText] = datePart.split('-');
+        const month = parseInt(monthText, 10);
+        const day = parseInt(dayText, 10);
 
         const now = new Date();
         const currentYear = now.getFullYear();
         const currentMonth = now.getMonth() + 1;
 
-        // 解析月份
-        const parts = timeStr.split('-');
-        const month = parseInt(parts[0], 10);
-
-        // 验证月份有效性
-        if (month < 1 || month > 12) {
-            console.warn(`无效的月份: ${month}`);
+        if (month < 1 || month > 12 || day < 1 || day > 31) {
+            console.warn(`无效的日期: ${datePart}`);
             return new Date();
         }
 
-        // 如果数据月份大于当前月份，说明是去年的数据
-        let year = currentYear;
-        if (month > currentMonth) {
-            year = currentYear - 1;
-        }
+        const contextYear = monthContext ? parseInt(monthContext.split('-')[0], 10) : null;
+        const year = contextYear || (month > currentMonth ? currentYear - 1 : currentYear);
 
-        const dateStr = `${year}-${timeStr}`;
+        const dateStr = `${year}-${monthText.padStart(2, '0')}-${dayText.padStart(2, '0')}T${clockPart}`;
         const parsedDate = new Date(dateStr);
 
-        // 验证解析结果
         if (isNaN(parsedDate.getTime())) {
             console.warn(`日期解析失败: ${dateStr}`);
             return new Date();
@@ -358,64 +359,69 @@ function parseTimeString(timeStr) {
         return parsedDate;
     } catch (error) {
         console.error('日期解析错误:', error.message);
-        return new Date(); // fallback to current time
+        return new Date(); // 返回当前时间作为兜底值。
     }
 }
 
-function calculateStats(data) {
-    // 数据验证
+function sortRecordsByTime(data, monthContext = null) {
+    return data
+        .map((record, index) => ({
+            record,
+            index,
+            timestamp: parseTimeString(record.time, getRecordMonthContext(record, monthContext)).getTime()
+        }))
+        .sort((a, b) => (a.timestamp - b.timestamp) || (a.index - b.index))
+        .map(item => item.record);
+}
+
+function calculateStats(data, monthContext = null) {
     if (!ValidationUtils.isValidArray(data, 2)) {
         console.warn('计算统计数据失败: 数据不足');
         return null;
     }
 
     try {
-        const lightValues = data.map(d => d.light_Balance).filter(v => v != null);
-        const acValues = data.map(d => d.ac_Balance).filter(v => v != null);
+        const orderedData = sortRecordsByTime(data, monthContext);
+        const parseRecordTime = record => parseTimeString(record.time, getRecordMonthContext(record, monthContext));
+        const lightValues = orderedData.map(d => d.light_Balance).filter(v => v != null);
+        const acValues = orderedData.map(d => d.ac_Balance).filter(v => v != null);
 
-        const latest = data[data.length - 1];
-        const latestTime = parseTimeString(latest.time);
+        const latest = orderedData[orderedData.length - 1];
+        const latestTime = parseRecordTime(latest);
 
-        // 找到今日0点
         const todayStart = new Date(latestTime);
         todayStart.setHours(0, 0, 0, 0);
 
-        // 查找今日0点或今日最早的记录
         let todayFirstRecord = null;
-        for (let i = 0; i < data.length; i++) {
-            const recordTime = parseTimeString(data[i].time);
+        for (let i = 0; i < orderedData.length; i++) {
+            const recordTime = parseRecordTime(orderedData[i]);
             if (recordTime >= todayStart) {
-                todayFirstRecord = data[i];
+                todayFirstRecord = orderedData[i];
                 break;
             }
         }
 
-        // 使用今日最早记录或上一条记录
-        const baseline = todayFirstRecord || (data.length > 1 ? data[data.length - 2] : latest);
+        const baseline = todayFirstRecord || (orderedData.length > 1 ? orderedData[orderedData.length - 2] : latest);
 
-        // 计算日均消耗 (取近两周的数据)
-        const lastTime = parseTimeString(latest.time);
+        const lastTime = parseRecordTime(latest);
         const twoWeeksAgo = new Date(lastTime.getTime() - CONSTANTS.TIME.TWO_WEEKS_MS);
 
-        // 筛选近两周的数据
-        const recentData = data.filter(d => {
+        const recentData = orderedData.filter(d => {
             try {
-                const t = parseTimeString(d.time);
+                const t = parseRecordTime(d);
                 return t >= twoWeeksAgo;
             } catch {
                 return false;
             }
         });
 
-        // 如果近两周数据不足，使用全部数据
-        const calcData = recentData.length >= 2 ? recentData : data;
+        const calcData = recentData.length >= 2 ? recentData : orderedData;
         const firstRecord = calcData[0];
         const lastRecord = calcData[calcData.length - 1];
-        const firstTime = parseTimeString(firstRecord.time);
-        const calcLastTime = parseTimeString(lastRecord.time);
+        const firstTime = parseRecordTime(firstRecord);
+        const calcLastTime = parseRecordTime(lastRecord);
         const daysDiff = Math.max(1, (calcLastTime.getTime() - firstTime.getTime()) / CONSTANTS.TIME.ONE_DAY_MS);
 
-        // 累计实际消耗（只计算电量减少的部分，忽略充电）
         let lightTotalConsumption = 0;
         let acTotalConsumption = 0;
         for (let i = 1; i < calcData.length; i++) {
@@ -423,16 +429,13 @@ function calculateStats(data) {
             const currLight = ValidationUtils.sanitizeElectricityValue(calcData[i].light_Balance || 0);
             const prevAc = ValidationUtils.sanitizeElectricityValue(calcData[i - 1].ac_Balance || 0);
             const currAc = ValidationUtils.sanitizeElectricityValue(calcData[i].ac_Balance || 0);
-            // 只累计消耗（电量减少），忽略充电（电量增加）
             if (prevLight > currLight) lightTotalConsumption += (prevLight - currLight);
             if (prevAc > currAc) acTotalConsumption += (prevAc - currAc);
         }
 
-        // 使用安全除法计算日均消耗
         const lightAvgDaily = MathUtils.safeDivide(lightTotalConsumption, daysDiff, 0).toFixed(1);
         const acAvgDaily = MathUtils.safeDivide(acTotalConsumption, daysDiff, 0).toFixed(1);
 
-        // 预计可用天数 (分开计算，使用安全除法)
         const lightDaysLeft = parseFloat(lightAvgDaily) > 0
             ? Math.floor(MathUtils.safeDivide(latest.light_Balance || 0, parseFloat(lightAvgDaily), 0))
             : '∞';
@@ -440,27 +443,21 @@ function calculateStats(data) {
             ? Math.floor(MathUtils.safeDivide(latest.ac_Balance || 0, parseFloat(acAvgDaily), 0))
             : '∞';
 
-        // 计算今日已消耗（今日0点/最早记录 - 当前记录 = 消耗量，正值表示消耗）
         const lightTrend = ((baseline.light_Balance || 0) - (latest.light_Balance || 0)).toFixed(1);
         const acTrend = ((baseline.ac_Balance || 0) - (latest.ac_Balance || 0)).toFixed(1);
 
-        // 计算昨日消耗
-        // 找到昨日0点
         const yesterdayStart = new Date(todayStart);
         yesterdayStart.setDate(yesterdayStart.getDate() - 1);
 
-        // 查找昨日0点后最早的记录(昨日开始)
         let yesterdayFirstRecord = null;
-        for (let i = 0; i < data.length; i++) {
-            const recordTime = parseTimeString(data[i].time);
+        for (let i = 0; i < orderedData.length; i++) {
+            const recordTime = parseRecordTime(orderedData[i]);
             if (recordTime >= yesterdayStart && recordTime < todayStart) {
-                yesterdayFirstRecord = data[i];
+                yesterdayFirstRecord = orderedData[i];
                 break;
             }
         }
 
-        // 昨日消耗 = 昨日开始记录(baseline) - 昨日结束记录(今日开始记录)
-        // 如果找不到昨日记录,消耗为0
         let lightYesterdayTrend = 0;
         let acYesterdayTrend = 0;
         if (yesterdayFirstRecord && baseline) {
@@ -492,54 +489,51 @@ function calculateStats(data) {
     }
 }
 
-function updateUI(data) {
+function updateUI(data, monthContext = null) {
     if (data.length === 0) return;
 
-    const latest = data[data.length - 1];
-    const lightValue = latest.light_Balance || 0;
-    const acValue = latest.ac_Balance || 0;
+    const orderedData = sortRecordsByTime(data, monthContext);
+    const latest = orderedData[orderedData.length - 1];
+    const lightValue = ValidationUtils.sanitizeElectricityValue(latest.light_Balance ?? 0);
+    const acValue = ValidationUtils.sanitizeElectricityValue(latest.ac_Balance ?? 0);
 
-    // 更新主卡片
     document.getElementById('light-value').textContent = lightValue.toFixed(1);
     document.getElementById('ac-value').textContent = acValue.toFixed(1);
 
-    const lightStatus = getStatus(lightValue);
-    const acStatus = getStatus(acValue);
+    const lightValues = orderedData.map(d => d.light_Balance).filter(v => v != null);
+    const acValues = orderedData.map(d => d.ac_Balance).filter(v => v != null);
+    const lightFull = Math.max(MathUtils.safeMax(lightValues, 0), lightValue);
+    const acFull = Math.max(MathUtils.safeMax(acValues, 0), acValue);
 
-    document.getElementById('light-status').textContent = lightStatus.text;
-    document.getElementById('light-status').className = `stat-status ${lightStatus.class}`;
-    document.getElementById('light-progress').style.width = `${lightStatus.percent}%`;
+    const lightStatus = getElectricityStatus(lightValue, lightFull);
+    const acStatus = getElectricityStatus(acValue, acFull);
 
-    document.getElementById('ac-status').textContent = acStatus.text;
-    document.getElementById('ac-status').className = `stat-status ${acStatus.class}`;
-    document.getElementById('ac-progress').style.width = `${acStatus.percent}%`;
+    setElectricityStatus(
+        document.getElementById('light-status'),
+        document.getElementById('light-progress'),
+        lightStatus
+    );
+    setElectricityStatus(
+        document.getElementById('ac-status'),
+        document.getElementById('ac-progress'),
+        acStatus
+    );
 
-    // 更新统计数据
-    const stats = calculateStats(data);
+    const stats = calculateStats(orderedData, monthContext);
     if (stats) {
-        // 更新昨日消耗
         const lightYesterdayTrendEl = document.getElementById('light-yesterday-trend');
         const acYesterdayTrendEl = document.getElementById('ac-yesterday-trend');
 
-        lightYesterdayTrendEl.querySelector('.trend-value').textContent =
-            (stats.lightYesterdayTrend >= 0 ? '-' : '+') + Math.abs(stats.lightYesterdayTrend);
-        lightYesterdayTrendEl.className = `stat-trend ${parseFloat(stats.lightYesterdayTrend) > 0 ? 'trend-down' : (parseFloat(stats.lightYesterdayTrend) < 0 ? 'trend-up' : '')}`;
+        setConsumptionTrend(lightYesterdayTrendEl, stats.lightYesterdayTrend);
 
-        acYesterdayTrendEl.querySelector('.trend-value').textContent =
-            (stats.acYesterdayTrend >= 0 ? '-' : '+') + Math.abs(stats.acYesterdayTrend);
-        acYesterdayTrendEl.className = `stat-trend ${parseFloat(stats.acYesterdayTrend) > 0 ? 'trend-down' : (parseFloat(stats.acYesterdayTrend) < 0 ? 'trend-up' : '')}`;
+        setConsumptionTrend(acYesterdayTrendEl, stats.acYesterdayTrend);
 
-        // 更新今日消耗
         const lightTrendEl = document.getElementById('light-trend');
         const acTrendEl = document.getElementById('ac-trend');
 
-        lightTrendEl.querySelector('.trend-value').textContent =
-            (stats.lightTrend >= 0 ? '-' : '+') + Math.abs(stats.lightTrend);
-        lightTrendEl.className = `stat-trend ${parseFloat(stats.lightTrend) > 0 ? 'trend-down' : (parseFloat(stats.lightTrend) < 0 ? 'trend-up' : '')}`;
+        setConsumptionTrend(lightTrendEl, stats.lightTrend);
 
-        acTrendEl.querySelector('.trend-value').textContent =
-            (stats.acTrend >= 0 ? '-' : '+') + Math.abs(stats.acTrend);
-        acTrendEl.className = `stat-trend ${parseFloat(stats.acTrend) > 0 ? 'trend-down' : (parseFloat(stats.acTrend) < 0 ? 'trend-up' : '')}`;
+        setConsumptionTrend(acTrendEl, stats.acTrend);
 
         document.getElementById('max-light').textContent = stats.maxLight;
         document.getElementById('min-light').textContent = stats.minLight;
@@ -554,13 +548,13 @@ function updateUI(data) {
     }
 }
 
-function renderCharts(data, type = 'line') {
+function renderCharts(data, type = 'line', monthContext = null) {
     const colors = getChartColors();
 
-    const processedData = data.map(e => ({
+    const processedData = sortRecordsByTime(data, monthContext).map(e => ({
         ...e,
-        timestamp: parseTimeString(e.time).getTime()
-    })).sort((a, b) => a.timestamp - b.timestamp);
+        timestamp: parseTimeString(e.time, getRecordMonthContext(e, monthContext)).getTime()
+    }));
 
     const lightData = processedData.map(e => [e.timestamp, e.light_Balance]);
     const acData = processedData.map(e => [e.timestamp, e.ac_Balance]);
@@ -569,9 +563,15 @@ function renderCharts(data, type = 'line') {
     chartAc.setOption(getChartOption('空调电量', colors.ac, colors.acGradient, acData, type));
 }
 
-// ==================== 数据加载 ====================
 async function fetchData(filepath) {
     const response = await fetch(filepath);
+    if (!response.ok) {
+        const error = new Error(`数据文件加载失败: ${filepath} (${response.status})`);
+        error.status = response.status;
+        error.filepath = filepath;
+        error.isMissingDataFile = response.status === 404;
+        throw error;
+    }
     return response.json();
 }
 
@@ -579,17 +579,22 @@ async function loadData() {
     try {
         const sel = document.getElementById('timeSplit').value;
         const data = await fetchData(`./data/${sel}.json`);
-        rawData = interpolateMissingData(data);
-        updateUI(rawData);
-        renderCharts(rawData, currentChartType);
+        currentDataMonth = getMonthContext(sel);
+        rawData = interpolateMissingData(sortRecordsByTime(data, currentDataMonth));
+        updateUI(rawData, currentDataMonth);
+        renderCharts(rawData, currentChartType, currentDataMonth);
         showToast('数据加载成功', 'success');
     } catch (err) {
+        if (err.isMissingDataFile) {
+            console.info(err.message);
+            showToast('暂无电量数据，等待首次更新', 'info');
+            return;
+        }
         console.error('加载错误:', err);
         showToast('数据加载失败', 'error');
     }
 }
 
-// ==================== 事件绑定 ====================
 document.getElementById('timeSplit').addEventListener('change', loadData);
 document.getElementById('refresh-btn').addEventListener('click', () => {
     document.getElementById('refresh-btn').classList.add('spinning');
@@ -600,19 +605,17 @@ document.getElementById('refresh-btn').addEventListener('click', () => {
     });
 });
 
-// 图表类型切换
 document.querySelectorAll('.btn-toggle').forEach(btn => {
     btn.addEventListener('click', () => {
         document.querySelectorAll('.btn-toggle').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         currentChartType = btn.dataset.type;
         if (rawData.length > 0) {
-            renderCharts(rawData, currentChartType);
+            renderCharts(rawData, currentChartType, currentDataMonth);
         }
     });
 });
 
-// 图表缩放控制
 document.querySelectorAll('[data-zoom]').forEach(btn => {
     btn.addEventListener('click', (e) => {
         const action = e.target.dataset.zoom;
@@ -624,7 +627,6 @@ document.querySelectorAll('[data-zoom]').forEach(btn => {
         } else {
             const option = chartInstance.getOption();
             const zoom = option.dataZoom[0];
-            const range = zoom.end - zoom.start;
             const delta = action === 'in' ? -CONSTANTS.CHART.DEFAULT_ZOOM_DELTA : CONSTANTS.CHART.DEFAULT_ZOOM_DELTA;
             const newStart = Math.max(0, zoom.start - delta / 2);
             const newEnd = Math.min(100, zoom.end + delta / 2);
@@ -633,13 +635,6 @@ document.querySelectorAll('[data-zoom]').forEach(btn => {
     });
 });
 
-// 响应式
-window.addEventListener('resize', () => {
-    chartLight.resize();
-    chartAc.resize();
-});
-
-// ==================== 初始化 ====================
 fetchData('./data/time.json').then(timeData => {
     const sel = document.getElementById('timeSplit');
     timeData.forEach(v => {
@@ -652,12 +647,10 @@ fetchData('./data/time.json').then(timeData => {
 }).catch(() => {
     loadData();
 });
-
-// ==================== 年度总结功能 ====================
 const reportModal = document.getElementById('report-modal');
 const reportBtn = document.getElementById('report-btn');
 const modalClose = document.getElementById('modal-close');
-const modalOverlay = document.querySelector('.modal-overlay');
+const reportModalOverlay = reportModal.querySelector('.modal-overlay');
 const exportBtn = document.getElementById('export-btn');
 const yearSelect = document.getElementById('report-year-select');
 
@@ -665,39 +658,31 @@ let chartDaily = null;
 let chartMonthly = null;
 let chartHeatmap = null;
 let yearlyData = {};
-let availableYears = [];
 
-// 打开模态框
 reportBtn.addEventListener('click', async () => {
     reportModal.classList.add('show');
-    document.body.style.overflow = 'hidden';
+    document.body.classList.add('modal-open');
     await initYearSelect();
 });
 
-// 关闭模态框
 function closeModal() {
     reportModal.classList.remove('show');
-    document.body.style.overflow = '';
+    document.body.classList.remove('modal-open');
 }
 
 modalClose.addEventListener('click', closeModal);
-modalOverlay.addEventListener('click', closeModal);
+reportModalOverlay.addEventListener('click', closeModal);
 
-// 年份选择变化
 yearSelect.addEventListener('change', async () => {
     await loadYearlyReport(parseInt(yearSelect.value));
 });
 
-// 初始化年份选择器
 async function initYearSelect() {
     try {
         const timeList = await fetchData('./data/time.json');
 
-        // 提取所有年份
         const years = [...new Set(timeList.map(m => m.split('-')[0]))].sort().reverse();
-        availableYears = years;
 
-        // 填充年份选择器
         yearSelect.innerHTML = '';
         years.forEach(year => {
             const opt = document.createElement('option');
@@ -706,7 +691,6 @@ async function initYearSelect() {
             yearSelect.add(opt);
         });
 
-        // 加载当前选中年份的数据
         if (years.length > 0) {
             await loadYearlyReport(parseInt(years[0]));
         }
@@ -716,15 +700,12 @@ async function initYearSelect() {
     }
 }
 
-// 加载年度报告数据
 async function loadYearlyReport(year) {
     try {
         showToast('正在加载年度数据...', 'info');
 
-        // 获取时间列表
         const timeList = await fetchData('./data/time.json');
 
-        // 筛选指定年份的月份文件
         const yearMonths = timeList.filter(m => m.startsWith(year.toString()));
 
         if (yearMonths.length === 0) {
@@ -732,7 +713,6 @@ async function loadYearlyReport(year) {
             return;
         }
 
-        // 加载所有月份数据
         const allData = [];
         for (const month of yearMonths) {
             try {
@@ -748,15 +728,12 @@ async function loadYearlyReport(year) {
             return;
         }
 
-        // 计算年度统计
         calculateYearlyStats(allData, year);
 
-        // 渲染图表
-        renderDailyChart(allData, year);
-        renderMonthlyChart(allData, year);
-        renderHeatmapChart(allData, year);
+        renderDailyChart();
+        renderMonthlyChart();
+        renderHeatmapChart(year);
 
-        // 确保图表正确 resize (模态框可能影响尺寸计算)
         setTimeout(() => {
             if (chartDaily) chartDaily.resize();
             if (chartMonthly) chartMonthly.resize();
@@ -770,22 +747,15 @@ async function loadYearlyReport(year) {
     }
 }
 
-// 计算年度统计数据
 function calculateYearlyStats(data, year) {
-    // 按日期分组计算每日消耗
     const dailyConsumption = {};
 
-    // 解析日期字符串，返回 YYYY-MM-DD 格式
     function parseDateStr(record) {
-        // record.time 可能的格式: "MM-DD HH:mm" 或 "MM-DD-HH"
-        // record.month 格式: "YYYY-MM"
-        const yearPart = record.month.split('-')[0]; // "2025"
-        const timePart = record.time.split(' ')[0]; // 取空格前的部分
+        const yearPart = record.month.split('-')[0]; // 年份部分
+        const timePart = record.time.split(' ')[0]; // 空格前的日期部分
 
-        // 检查 timePart 是否包含多个连字符 (如 "05-05-23")
         const parts = timePart.split('-');
         if (parts.length >= 2) {
-            // 取前两部分作为 MM-DD
             const month = parts[0].padStart(2, '0');
             const day = parts[1].padStart(2, '0');
             return `${yearPart}-${month}-${day}`;
@@ -793,11 +763,9 @@ function calculateYearlyStats(data, year) {
         return `${yearPart}-${timePart}`;
     }
 
-    // 解析完整时间戳用于排序
     function parseTimestamp(record) {
         const yearPart = record.month.split('-')[0];
         const timePart = record.time;
-        // 尝试解析 "MM-DD HH:mm" 格式
         const parts = timePart.split(' ');
         const datePart = parts[0].split('-');
         const month = datePart[0].padStart(2, '0');
@@ -806,7 +774,6 @@ function calculateYearlyStats(data, year) {
         return new Date(`${yearPart}-${month}-${day}T${time}`);
     }
 
-    // 按日期分组所有记录
     const recordsByDate = {};
     data.forEach(record => {
         const dateStr = parseDateStr(record);
@@ -816,168 +783,122 @@ function calculateYearlyStats(data, year) {
         recordsByDate[dateStr].push(record);
     });
 
-    // 对每个日期，计算当日的消耗
     const sortedDates = Object.keys(recordsByDate)
         .filter(dateStr => dateStr.startsWith(year.toString()))
         .sort();
 
     sortedDates.forEach((dateStr, index) => {
-        const dayRecords = recordsByDate[dateStr].sort((a, b) => parseTimestamp(a) - parseTimestamp(b));
+        const dayRecords = recordsByDate[dateStr].slice().sort((a, b) => parseTimestamp(a) - parseTimestamp(b));
+        if (dayRecords.length === 0) return;
 
-        if (dayRecords.length > 0) {
-            const firstRecord = dayRecords[0];
-            const lastRecord = dayRecords[dayRecords.length - 1];
-
-            // 获取下一天的第一条记录
-            let nextDayFirstRecord = null;
-            if (index < sortedDates.length - 1) {
-                const nextDateStr = sortedDates[index + 1];
-                const nextDayRecords = recordsByDate[nextDateStr];
-                if (nextDayRecords && nextDayRecords.length > 0) {
-                    nextDayFirstRecord = nextDayRecords.sort((a, b) => parseTimestamp(a) - parseTimestamp(b))[0];
-                }
-            }
-
-            let lightConsumption = 0;
-            let acConsumption = 0;
-
-            if (nextDayFirstRecord) {
-                // 检查下一日是否为连续日期（修复102度异常值问题）
-                const currentDate = new Date(dateStr);
-                const nextDate = new Date(sortedDates[index + 1]);
-                const dayDiff = (nextDate - currentDate) / CONSTANTS.TIME.ONE_DAY_MS;
-
-                if (dayDiff <= CONSTANTS.TIME.CONTINUOUS_DAY_THRESHOLD) { // 连续日期
-                    // 历史日期：当日消耗 = 当日第一条记录 - 下一日第一条记录
-                    lightConsumption = Math.max(0, (firstRecord.light_Balance || 0) - (nextDayFirstRecord.light_Balance || 0));
-                    acConsumption = Math.max(0, (firstRecord.ac_Balance || 0) - (nextDayFirstRecord.ac_Balance || 0));
-                } else {
-                    // 非连续日期，使用当日首尾差值（避免跨日期间隔异常值）
-                    console.warn(`检测到非连续日期: ${dateStr} -> ${sortedDates[index + 1]}, 间隔${dayDiff.toFixed(1)}天，使用当日首尾差值`);
-                    if (dayRecords.length >= 2) {
-                        lightConsumption = Math.max(0, (firstRecord.light_Balance || 0) - (lastRecord.light_Balance || 0));
-                        acConsumption = Math.max(0, (firstRecord.ac_Balance || 0) - (lastRecord.ac_Balance || 0));
-                    }
-                }
-            } else {
-                // 今日或最后一天：当日消耗 = 当日第一条记录 - 当日最后一条记录
-                if (dayRecords.length >= 2) {
-                    lightConsumption = Math.max(0, (firstRecord.light_Balance || 0) - (lastRecord.light_Balance || 0));
-                    acConsumption = Math.max(0, (firstRecord.ac_Balance || 0) - (lastRecord.ac_Balance || 0));
-                }
-                // 如果只有一条记录，消耗为0（已经是默认值）
-            }
-
-            dailyConsumption[dateStr] = {
-                light: lightConsumption,
-                ac: acConsumption
-            };
+        // 当日内：累加每一次正向下降。充值是正跳变，max(0,…) 会自动剔除，
+        // 而充值前已发生的消耗会被前面的区间正确计入（不会被一次充值抹平整天）。
+        let lightConsumption = 0;
+        let acConsumption = 0;
+        for (let i = 1; i < dayRecords.length; i++) {
+            lightConsumption += Math.max(0, (dayRecords[i - 1].light_Balance || 0) - (dayRecords[i].light_Balance || 0));
+            acConsumption += Math.max(0, (dayRecords[i - 1].ac_Balance || 0) - (dayRecords[i].ac_Balance || 0));
         }
+
+        // 隔夜：当日末读 → 次日首读（仅当两个日期连续时计入），同样只取下降部分。
+        if (index < sortedDates.length - 1) {
+            const nextDayRecords = recordsByDate[sortedDates[index + 1]];
+            const dayDiff = (new Date(sortedDates[index + 1]) - new Date(dateStr)) / CONSTANTS.TIME.ONE_DAY_MS;
+            if (nextDayRecords && nextDayRecords.length > 0 && dayDiff <= CONSTANTS.TIME.CONTINUOUS_DAY_THRESHOLD) {
+                const lastRecord = dayRecords[dayRecords.length - 1];
+                const nextDayFirst = nextDayRecords.slice().sort((a, b) => parseTimestamp(a) - parseTimestamp(b))[0];
+                lightConsumption += Math.max(0, (lastRecord.light_Balance || 0) - (nextDayFirst.light_Balance || 0));
+                acConsumption += Math.max(0, (lastRecord.ac_Balance || 0) - (nextDayFirst.ac_Balance || 0));
+            }
+        }
+
+        dailyConsumption[dateStr] = {
+            light: lightConsumption,
+            ac: acConsumption
+        };
     });
 
-    // 先计算总消耗（只使用实际数据，不包括插值数据）
-    let totalLight = 0, totalAc = 0;
-    let peakDay = '', peakValue = 0;
-
-    Object.entries(dailyConsumption).forEach(([date, consumption]) => {
-        totalLight += consumption.light;
-        totalAc += consumption.ac;
+    const totals = Object.entries(dailyConsumption).reduce((acc, [date, consumption]) => {
+        acc.totalLight += consumption.light;
+        acc.totalAc += consumption.ac;
 
         const dayTotal = consumption.light + consumption.ac;
-        if (dayTotal > peakValue) {
-            peakValue = dayTotal;
-            peakDay = date;
+        if (dayTotal > acc.peakValue) {
+            acc.peakValue = dayTotal;
+            acc.peakDay = date;
         }
-    });
+        return acc;
+    }, { totalLight: 0, totalAc: 0, peakDay: '', peakValue: 0 });
 
-    // 填充缺失日期的数据（使用余额插值，避免消耗量异常）
+    const { totalLight, totalAc, peakDay, peakValue } = totals;
+
+    // 在首尾数据日期之间为缺失日期插值填充（仅供热力图/折线连续展示，
+    // 不影响上面基于真实数据计算的总额与峰值）。
     const existingDates = Object.keys(dailyConsumption).sort();
-
     if (existingDates.length > 1) {
-        const firstDate = existingDates[0];
-        const lastDate = existingDates[existingDates.length - 1];
+        const startDate = new Date(existingDates[0]);
+        const endDate = new Date(existingDates[existingDates.length - 1]);
 
-        // 只在第一个数据日期和最后一个数据日期之间填充
-        const startDate = new Date(firstDate);
-        const endDate = new Date(lastDate);
-
-        // 生成需要填充的日期范围
         const allDatesInRange = [];
         for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
             allDatesInRange.push(d.toISOString().split('T')[0]);
         }
 
-        // 对于缺失的日期，使用简单的平均消耗量填充
-        // 计算现有数据的平均消耗量
         const existingConsumptions = Object.values(dailyConsumption);
-        const avgLightConsumption = existingConsumptions.length > 0 ?
-            existingConsumptions.reduce((sum, d) => sum + d.light, 0) / existingConsumptions.length : 0;
-        const avgAcConsumption = existingConsumptions.length > 0 ?
-            existingConsumptions.reduce((sum, d) => sum + d.ac, 0) / existingConsumptions.length : 0;
+        const avgLightConsumption = existingConsumptions.length > 0
+            ? existingConsumptions.reduce((sum, d) => sum + d.light, 0) / existingConsumptions.length
+            : 0;
+        const avgAcConsumption = existingConsumptions.length > 0
+            ? existingConsumptions.reduce((sum, d) => sum + d.ac, 0) / existingConsumptions.length
+            : 0;
 
-        // 填充缺失的日期（使用平均消耗量，避免异常值）
         allDatesInRange.forEach(dateStr => {
-            if (!dailyConsumption[dateStr]) {
-                // 寻找最近的前后数据点
-                let prevData = null;
-                let nextData = null;
+            if (dailyConsumption[dateStr]) return;
 
-                // 向前查找最近的数据
-                for (let i = existingDates.length - 1; i >= 0; i--) {
-                    if (existingDates[i] < dateStr) {
-                        prevData = dailyConsumption[existingDates[i]];
-                        break;
-                    }
+            let prevData = null;
+            let nextData = null;
+            for (let i = existingDates.length - 1; i >= 0; i--) {
+                if (existingDates[i] < dateStr) {
+                    prevData = dailyConsumption[existingDates[i]];
+                    break;
                 }
-
-                // 向后查找最近的数据
-                for (let i = 0; i < existingDates.length; i++) {
-                    if (existingDates[i] > dateStr) {
-                        nextData = dailyConsumption[existingDates[i]];
-                        break;
-                    }
-                }
-
-                let lightValue = 0;
-                let acValue = 0;
-
-                if (prevData && nextData) {
-                    // 使用前后数据的平均值，但限制在合理范围内
-                    lightValue = Math.min((prevData.light + nextData.light) / 2, avgLightConsumption * 2);
-                    acValue = Math.min((prevData.ac + nextData.ac) / 2, avgAcConsumption * 2);
-                } else if (prevData) {
-                    // 只有前面的数据，使用该数据但限制范围
-                    lightValue = Math.min(prevData.light, avgLightConsumption * 2);
-                    acValue = Math.min(prevData.ac, avgAcConsumption * 2);
-                } else if (nextData) {
-                    // 只有后面的数据，使用该数据但限制范围
-                    lightValue = Math.min(nextData.light, avgLightConsumption * 2);
-                    acValue = Math.min(nextData.ac, avgAcConsumption * 2);
-                } else {
-                    // 使用平均消耗量
-                    lightValue = avgLightConsumption;
-                    acValue = avgAcConsumption;
-                }
-
-                // 确保消耗量在合理范围内
-                lightValue = MathUtils.clamp(lightValue, 0, CONSTANTS.ELECTRICITY.MAX_DAILY_CONSUMPTION);
-                acValue = MathUtils.clamp(acValue, 0, CONSTANTS.ELECTRICITY.MAX_DAILY_CONSUMPTION);
-
-                dailyConsumption[dateStr] = {
-                    light: lightValue,
-                    ac: acValue
-                };
             }
+            for (let i = 0; i < existingDates.length; i++) {
+                if (existingDates[i] > dateStr) {
+                    nextData = dailyConsumption[existingDates[i]];
+                    break;
+                }
+            }
+
+            let lightValue;
+            let acValue;
+            if (prevData && nextData) {
+                lightValue = Math.min((prevData.light + nextData.light) / 2, avgLightConsumption * 2);
+                acValue = Math.min((prevData.ac + nextData.ac) / 2, avgAcConsumption * 2);
+            } else if (prevData) {
+                lightValue = Math.min(prevData.light, avgLightConsumption * 2);
+                acValue = Math.min(prevData.ac, avgAcConsumption * 2);
+            } else if (nextData) {
+                lightValue = Math.min(nextData.light, avgLightConsumption * 2);
+                acValue = Math.min(nextData.ac, avgAcConsumption * 2);
+            } else {
+                lightValue = avgLightConsumption;
+                acValue = avgAcConsumption;
+            }
+
+            dailyConsumption[dateStr] = {
+                light: MathUtils.clamp(lightValue, 0, CONSTANTS.ELECTRICITY.MAX_DAILY_CONSUMPTION),
+                ac: MathUtils.clamp(acValue, 0, CONSTANTS.ELECTRICITY.MAX_DAILY_CONSUMPTION)
+            };
         });
     }
 
-    // 计算占比（使用实际总消耗）
     const total = totalLight + totalAc;
     const lightPercent = total > 0 ? ((totalLight / total) * 100).toFixed(1) : 0;
     const acPercent = total > 0 ? ((totalAc / total) * 100).toFixed(1) : 0;
 
-    // 更新 UI
     document.getElementById('report-total').textContent = total.toFixed(2) + ' 度';
+    document.getElementById('report-total-year').textContent = `${year} 年`;
     document.getElementById('report-light-total').textContent = totalLight.toFixed(2) + ' 度';
     document.getElementById('report-light-percent').textContent = `占比 ${lightPercent}%`;
     document.getElementById('report-ac-total').textContent = totalAc.toFixed(2) + ' 度';
@@ -985,7 +906,6 @@ function calculateYearlyStats(data, year) {
     document.getElementById('report-peak').textContent = peakValue.toFixed(2) + ' 度';
     document.getElementById('report-peak-date').textContent = peakDay;
 
-    // 数据范围
     const dates = Object.keys(dailyConsumption).sort();
     if (dates.length > 0) {
         document.getElementById('report-date-range').textContent =
@@ -995,8 +915,7 @@ function calculateYearlyStats(data, year) {
     yearlyData = { dailyConsumption, totalLight, totalAc };
 }
 
-// 渲染每日用电图表
-function renderDailyChart(data, year) {
+function renderDailyChart() {
     if (!chartDaily) {
         chartDaily = echarts.init(document.getElementById('chart-daily'));
     }
@@ -1005,8 +924,8 @@ function renderDailyChart(data, year) {
     const dailyData = yearlyData.dailyConsumption;
 
     const dates = Object.keys(dailyData).sort();
-    const lightData = dates.map(d => [d, dailyData[d].light.toFixed(2)]);
-    const acData = dates.map(d => [d, dailyData[d].ac.toFixed(2)]);
+    const lightData = dates.map(d => dailyData[d].light.toFixed(2));
+    const acData = dates.map(d => dailyData[d].ac.toFixed(2));
 
     const option = {
         tooltip: {
@@ -1048,7 +967,7 @@ function renderDailyChart(data, year) {
                 type: 'line',
                 smooth: true,
                 symbol: 'none',
-                data: lightData.map(d => d[1]),
+                data: lightData,
                 lineStyle: { color: '#3b82f6', width: 2 },
                 areaStyle: {
                     color: {
@@ -1065,14 +984,14 @@ function renderDailyChart(data, year) {
                 type: 'line',
                 smooth: true,
                 symbol: 'none',
-                data: acData.map(d => d[1]),
-                lineStyle: { color: '#ef4444', width: 2 },
+                data: acData,
+                lineStyle: { color: '#10b981', width: 2 },
                 areaStyle: {
                     color: {
                         type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
                         colorStops: [
-                            { offset: 0, color: 'rgba(239, 68, 68, 0.3)' },
-                            { offset: 1, color: 'rgba(239, 68, 68, 0.05)' }
+                            { offset: 0, color: 'rgba(16, 185, 129, 0.3)' },
+                            { offset: 1, color: 'rgba(16, 185, 129, 0.05)' }
                         ]
                     }
                 }
@@ -1087,8 +1006,7 @@ function renderDailyChart(data, year) {
     chartDaily.setOption(option);
 }
 
-// 渲染月度统计图表
-function renderMonthlyChart(data, year) {
+function renderMonthlyChart() {
     if (!chartMonthly) {
         chartMonthly = echarts.init(document.getElementById('chart-monthly'));
     }
@@ -1096,7 +1014,6 @@ function renderMonthlyChart(data, year) {
     const colors = getChartColors();
     const dailyData = yearlyData.dailyConsumption;
 
-    // 按月汇总
     const monthlyStats = {};
     Object.entries(dailyData).forEach(([date, consumption]) => {
         const month = date.substring(0, 7);
@@ -1166,7 +1083,7 @@ function renderMonthlyChart(data, year) {
                 stack: 'total',
                 data: acData,
                 itemStyle: {
-                    color: '#ef4444',
+                    color: '#10b981',
                     borderRadius: [4, 4, 0, 0]
                 }
             }
@@ -1176,8 +1093,7 @@ function renderMonthlyChart(data, year) {
     chartMonthly.setOption(option);
 }
 
-// 渲染热力图
-function renderHeatmapChart(data, year) {
+function renderHeatmapChart(year) {
     if (!chartHeatmap) {
         chartHeatmap = echarts.init(document.getElementById('chart-heatmap'));
     }
@@ -1185,24 +1101,20 @@ function renderHeatmapChart(data, year) {
     const colors = getChartColors();
     const dailyData = yearlyData.dailyConsumption;
 
-    // 检查是否有数据
     if (!dailyData || Object.keys(dailyData).length === 0) {
         console.warn('热力图: 无数据');
         return;
     }
 
-    // 转换为热力图数据格式 (ECharts calendar 需要 YYYY-MM-DD 格式和数字类型)
     const heatmapData = [];
     let maxValue = 0;
     Object.entries(dailyData).forEach(([date, consumption]) => {
         const total = consumption.light + consumption.ac;
         const value = parseFloat(total.toFixed(2));
-        // 确保日期格式正确 (YYYY-MM-DD) 且值为数字
         heatmapData.push([date, value]);
         if (value > maxValue) maxValue = value;
     });
 
-    // 动态计算 visualMap 的最大值
     const visualMapMax = Math.max(10, Math.ceil(maxValue / 10) * 10);
 
     const option = {
@@ -1256,34 +1168,24 @@ function renderHeatmapChart(data, year) {
     chartHeatmap.setOption(option);
 }
 
-// 导出图片功能
 exportBtn.addEventListener('click', async () => {
     showToast('正在生成图片...', 'info');
 
+    const reportContent = document.getElementById('report-content');
+    const yearSelect = document.getElementById('report-year-select');
+    const titleElement = document.querySelector('.report-header h2');
+    const originalTitle = titleElement.textContent;
+    const currentYear = yearSelect.value;
+
     try {
-        // 动态加载 modern-screenshot
         if (typeof modernScreenshot === 'undefined') {
-            await loadScript('https://cdn.jsdelivr.net/npm/modern-screenshot@4.6.7/dist/index.js');
+            await loadScript('https://cdn.jsdelivr.net/npm/modern-screenshot/dist/index.js');
         }
 
-        const reportContent = document.getElementById('report-content');
-        const yearSelect = document.getElementById('report-year-select');
+        reportModal.classList.add('is-exporting');
 
-        // 临时隐藏关闭按钮和导出按钮
-        const closeBtn = document.getElementById('modal-close');
-        const exportBtnEl = document.getElementById('export-btn');
-        closeBtn.style.display = 'none';
-        exportBtnEl.style.display = 'none';
+        titleElement.textContent = `⚡ ${currentYear} 宿舍用电年度总结`;
 
-        // 临时替换整个标题，避免select元素渲染问题
-        const titleElement = document.querySelector('.report-header h2');
-        const originalTitle = titleElement.innerHTML;
-        const currentYear = yearSelect.value;
-
-        // 直接设置为纯文本标题
-        titleElement.innerHTML = `⚡ ${currentYear} 宿舍用电年度总结`;
-
-        // 使用 modern-screenshot 生成图片
         const dataUrl = await modernScreenshot.domToPng(reportContent, {
             scale: 2,
             backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-primary').trim(),
@@ -1296,14 +1198,6 @@ exportBtn.addEventListener('click', async () => {
             }
         });
 
-        // 恢复原始标题
-        titleElement.innerHTML = originalTitle;
-
-        // 恢复按钮
-        closeBtn.style.display = '';
-        exportBtnEl.style.display = '';
-
-        // 下载图片
         const link = document.createElement('a');
         link.download = `电量年度总结_${currentYear}.png`;
         link.href = dataUrl;
@@ -1313,21 +1207,39 @@ exportBtn.addEventListener('click', async () => {
     } catch (err) {
         console.error('导出失败:', err);
         showToast('导出失败', 'error');
+    } finally {
+        titleElement.textContent = originalTitle;
+        reportModal.classList.remove('is-exporting');
     }
 });
 
-// 动态加载脚本
 function loadScript(src) {
     return new Promise((resolve, reject) => {
+        const existingScript = document.querySelector(`script[src="${src}"]`);
+        if (existingScript) {
+            if (existingScript.dataset.loaded === 'true') {
+                resolve();
+                return;
+            }
+            existingScript.addEventListener('load', resolve, { once: true });
+            existingScript.addEventListener('error', reject, { once: true });
+            return;
+        }
+
         const script = document.createElement('script');
         script.src = src;
-        script.onload = resolve;
-        script.onerror = reject;
+        script.onload = () => {
+            script.dataset.loaded = 'true';
+            resolve();
+        };
+        script.onerror = () => {
+            script.remove();
+            reject();
+        };
         document.head.appendChild(script);
     });
 }
 
-// 窗口大小变化时调整图表
 window.addEventListener('resize', () => {
     chartLight.resize();
     chartAc.resize();
@@ -1336,40 +1248,43 @@ window.addEventListener('resize', () => {
     if (chartHeatmap) chartHeatmap.resize();
 });
 
-// ==================== 房间查询器功能 ====================
 
-// 房间查询器事件绑定
 document.addEventListener('DOMContentLoaded', function() {
-    // 绑定房间查询按钮
     const roomFinderBtn = document.getElementById('room-query-btn');
     const roomQueryModal = document.getElementById('room-query-modal');
     const roomModalClose = document.getElementById('room-modal-close');
+    const roomModalOverlay = roomQueryModal?.querySelector('.modal-overlay');
+
+    function openRoomModal() {
+        roomQueryModal.classList.add('show');
+        document.body.classList.add('modal-open');
+    }
+
+    function closeRoomModal() {
+        roomQueryModal.classList.remove('show');
+        document.body.classList.remove('modal-open');
+    }
 
     if (roomFinderBtn && roomQueryModal) {
-        roomFinderBtn.addEventListener('click', () => {
-            roomQueryModal.style.display = 'block';
-            document.body.style.overflow = 'hidden';
-        });
+        roomFinderBtn.addEventListener('click', openRoomModal);
     }
 
     if (roomModalClose && roomQueryModal) {
-        roomModalClose.addEventListener('click', () => {
-            roomQueryModal.style.display = 'none';
-            document.body.style.overflow = '';
-        });
+        roomModalClose.addEventListener('click', closeRoomModal);
     }
 
-    // 点击模态框背景关闭
+    if (roomModalOverlay) {
+        roomModalOverlay.addEventListener('click', closeRoomModal);
+    }
+
     if (roomQueryModal) {
         roomQueryModal.addEventListener('click', (e) => {
             if (e.target === roomQueryModal) {
-                roomQueryModal.style.display = 'none';
-                document.body.style.overflow = '';
+                closeRoomModal();
             }
         });
     }
 
-    // 房间查询器功能
     const areaSelect = document.getElementById('area-select');
     const buildingSelect = document.getElementById('building-select');
     const unitSelect = document.getElementById('unit-select');
@@ -1381,235 +1296,222 @@ document.addEventListener('DOMContentLoaded', function() {
 
     let currentLightRoomId = '';
     let currentAcRoomId = '';
+    const roomDataCache = new Map();
+    const gardenOrder = ['柳园', '荷园', '菊园', '松园'];
 
-    // 区域选择变化
+    function sortByFirstNumber(a, b) {
+        const numA = parseInt((a.match(/\d+/) || [0])[0], 10);
+        const numB = parseInt((b.match(/\d+/) || [0])[0], 10);
+        return numA === numB ? a.localeCompare(b) : numA - numB;
+    }
+
+    function sortBuildingNames(names) {
+        return names.sort((a, b) => {
+            const gardenA = gardenOrder.find(garden => a.startsWith(garden)) || '';
+            const gardenB = gardenOrder.find(garden => b.startsWith(garden)) || '';
+            const gardenDiff = gardenOrder.indexOf(gardenA) - gardenOrder.indexOf(gardenB);
+            return gardenDiff || sortByFirstNumber(a, b);
+        });
+    }
+
+    function setSelectOptions(select, placeholder, values = []) {
+        select.innerHTML = `<option value="">${placeholder}</option>`;
+        values.forEach(value => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = value;
+            select.appendChild(option);
+        });
+    }
+
+    function getBuilding(areaData, buildingName) {
+        return areaData?.buildings?.[buildingName] || null;
+    }
+
+    function findRoomUnit(units, keyword) {
+        const matched = Object.entries(units).find(([name]) => name.includes(keyword));
+        return matched ? matched[1] : units['房间用电'] || null;
+    }
+
+    function isLikelyPairedRoom(sourceRoom, targetRoom) {
+        const source = String(sourceRoom || '');
+        const target = String(targetRoom || '');
+        if (!source || !target) return false;
+        if (source === target) return true;
+
+        const shorter = source.length <= target.length ? source : target;
+        const longer = source.length > target.length ? source : target;
+        return shorter.length >= 3 && longer.endsWith(shorter);
+    }
+
+    function getRoomId(unit, roomNumber, fallbackIndex = -1) {
+        if (!unit?.rooms || !unit?.ids) return '';
+        const directIndex = unit.rooms.indexOf(roomNumber);
+        const fallbackRoom = unit.rooms[fallbackIndex];
+        const roomIndex = directIndex !== -1
+            ? directIndex
+            : isLikelyPairedRoom(roomNumber, fallbackRoom)
+                ? fallbackIndex
+                : -1;
+        return roomIndex >= 0 ? unit.ids[roomIndex] || '' : '';
+    }
+
+    function setRoomResult(resultEl, copyBtn, roomId, missingText) {
+        resultEl.textContent = roomId || missingText;
+        copyBtn.disabled = !roomId;
+        return roomId || '';
+    }
+
+    async function loadRoomData(areaId) {
+        if (!areaId) return null;
+        if (roomDataCache.has(areaId)) {
+            return roomDataCache.get(areaId);
+        }
+
+        const dataPromise = fetch(`./data/rooms/${areaId}.json`)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`Failed to load room data for area ${areaId}: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (!data || !data.buildings || typeof data.buildings !== 'object') {
+                    throw new Error(`Invalid room data for area ${areaId}`);
+                }
+                roomDataCache.set(areaId, data);
+                return data;
+            })
+            .catch(error => {
+                roomDataCache.delete(areaId);
+                throw error;
+            });
+        roomDataCache.set(areaId, dataPromise);
+        return dataPromise;
+    }
+
     if (areaSelect) {
-        areaSelect.addEventListener('change', function() {
+        areaSelect.addEventListener('change', async function() {
             const areaId = this.value;
 
-            // 重置后续选择器
-            buildingSelect.innerHTML = '<option value="">请选择建筑</option>';
-            unitSelect.innerHTML = '<option value="">请选择单元</option>';
-            roomSelect.innerHTML = '<option value="">请选择房间</option>';
+            setSelectOptions(buildingSelect, '请选择建筑');
+            setSelectOptions(unitSelect, '请选择单元');
+            setSelectOptions(roomSelect, '请选择房间');
             buildingSelect.disabled = !areaId;
             unitSelect.disabled = true;
             roomSelect.disabled = true;
 
-            // 清空结果
             clearResults();
 
-            if (areaId && window.roomData && window.roomData[areaId]) {
-                const buildings = window.roomData[areaId].buildings;
-                // 对建筑名称按柳荷菊松顺序，然后按数字排序
-                const sortedBuildingNames = Object.keys(buildings).sort((a, b) => {
-                    // 定义园区优先级：柳荷菊松
-                    const gardenOrder = ['柳园', '荷园', '菊园', '松园'];
+            if (areaId) {
+                buildingSelect.disabled = true;
+                buildingSelect.innerHTML = '<option value="">正在加载建筑...</option>';
+            }
 
-                    // 提取园区名称
-                    const gardenA = gardenOrder.find(garden => a.startsWith(garden)) || '';
-                    const gardenB = gardenOrder.find(garden => b.startsWith(garden)) || '';
+            try {
+                const areaData = await loadRoomData(areaId);
+                if (areaSelect.value !== areaId) return;
+                if (!areaData) {
+                    setSelectOptions(buildingSelect, '请选择建筑');
+                    buildingSelect.disabled = true;
+                    return;
+                }
 
-                    // 先按园区排序
-                    const gardenIndexA = gardenOrder.indexOf(gardenA);
-                    const gardenIndexB = gardenOrder.indexOf(gardenB);
-
-                    if (gardenIndexA !== gardenIndexB) {
-                        return gardenIndexA - gardenIndexB;
-                    }
-
-                    // 同一园区内按数字排序
-                    const matchA = a.match(/\d+/);
-                    const matchB = b.match(/\d+/);
-                    const numA = matchA ? parseInt(matchA[0]) : 0;
-                    const numB = matchB ? parseInt(matchB[0]) : 0;
-                    if (numA !== numB) return numA - numB;
-
-                    // 如果数字相同，按字符串排序
-                    return a.localeCompare(b);
-                });
-
-                sortedBuildingNames.forEach(buildingName => {
-                    const option = document.createElement('option');
-                    option.value = buildingName;
-                    option.textContent = buildingName;
-                    buildingSelect.appendChild(option);
-                });
+                const buildings = areaData.buildings;
+                setSelectOptions(buildingSelect, '请选择建筑', sortBuildingNames(Object.keys(buildings)));
+                buildingSelect.disabled = false;
+            } catch (error) {
+                if (areaSelect.value !== areaId) return;
+                console.error('房间数据加载失败:', error);
+                buildingSelect.innerHTML = '<option value="">房间数据加载失败</option>';
+                buildingSelect.disabled = true;
+                setSelectOptions(unitSelect, '请选择单元');
+                unitSelect.disabled = true;
+                setSelectOptions(roomSelect, '请选择房间');
+                roomSelect.disabled = true;
+                showToast('房间数据加载失败，请稍后重试', 'error');
             }
         });
     }
 
-    // 建筑选择变化
     if (buildingSelect) {
         buildingSelect.addEventListener('change', function() {
             const areaId = areaSelect.value;
             const buildingName = this.value;
+            const areaData = roomDataCache.get(areaId);
 
-            // 重置后续选择器
-            unitSelect.innerHTML = '<option value="">请选择单元</option>';
-            roomSelect.innerHTML = '<option value="">请选择房间</option>';
+            setSelectOptions(unitSelect, '请选择单元');
+            setSelectOptions(roomSelect, '请选择房间');
             unitSelect.disabled = !buildingName;
             roomSelect.disabled = true;
 
-            // 清空结果
             clearResults();
 
-            if (areaId && buildingName && window.roomData && window.roomData[areaId].buildings[buildingName]) {
-                const units = window.roomData[areaId].buildings[buildingName].units;
-                // 对单元名称进行数字排序
-                const sortedUnitNames = Object.keys(units).sort((a, b) => {
-                    // 提取数字进行比较
-                    const matchA = a.match(/\d+/);
-                    const matchB = b.match(/\d+/);
-                    const numA = matchA ? parseInt(matchA[0]) : 0;
-                    const numB = matchB ? parseInt(matchB[0]) : 0;
-                    if (numA !== numB) return numA - numB;
-                    // 如果数字相同，按字符串排序
-                    return a.localeCompare(b);
-                });
-
-                sortedUnitNames.forEach(unitName => {
-                    const option = document.createElement('option');
-                    option.value = unitName;
-                    option.textContent = unitName;
-                    unitSelect.appendChild(option);
-                });
+            const building = getBuilding(areaData, buildingName);
+            if (building?.units) {
+                setSelectOptions(unitSelect, '请选择单元', Object.keys(building.units).sort(sortByFirstNumber));
             }
         });
     }
 
-    // 单元选择变化
     if (unitSelect) {
         unitSelect.addEventListener('change', function() {
             const areaId = areaSelect.value;
             const buildingName = buildingSelect.value;
             const unitName = this.value;
+            const areaData = roomDataCache.get(areaId);
 
-            // 重置房间选择器
-            roomSelect.innerHTML = '<option value="">请选择房间</option>';
+            setSelectOptions(roomSelect, '请选择房间');
             roomSelect.disabled = !unitName;
 
-            // 清空结果
             clearResults();
 
-            if (areaId && buildingName && unitName && window.roomData) {
-                const unit = window.roomData[areaId].buildings[buildingName].units[unitName];
-                if (unit && unit.rooms) {
-                    // 对房间号进行数字排序
-                    const sortedRooms = unit.rooms.slice().sort((a, b) => {
-                        // 提取数字进行比较
-                        const matchA = a.match(/\d+/);
-                        const matchB = b.match(/\d+/);
-                        const numA = matchA ? parseInt(matchA[0]) : 0;
-                        const numB = matchB ? parseInt(matchB[0]) : 0;
-                        if (numA !== numB) return numA - numB;
-                        // 如果数字相同，按字符串排序
-                        return a.localeCompare(b);
-                    });
-
-                    sortedRooms.forEach(room => {
-                        const option = document.createElement('option');
-                        option.value = room;
-                        option.textContent = room;
-                        roomSelect.appendChild(option);
-                    });
-                }
+            const unit = getBuilding(areaData, buildingName)?.units?.[unitName];
+            if (unit?.rooms) {
+                setSelectOptions(roomSelect, '请选择房间', unit.rooms.slice().sort(sortByFirstNumber));
             }
         });
     }
 
-    // 房间选择变化
     if (roomSelect) {
         roomSelect.addEventListener('change', function() {
             const areaId = areaSelect.value;
             const buildingName = buildingSelect.value;
             const unitName = unitSelect.value;
             const roomNumber = this.value;
+            const areaData = roomDataCache.get(areaId);
+            const building = getBuilding(areaData, buildingName);
+            const units = building?.units;
+            const selectedUnit = units?.[unitName];
+            const selectedIndex = selectedUnit?.rooms?.indexOf(roomNumber) ?? -1;
 
-            if (areaId && buildingName && unitName && roomNumber && window.roomData) {
-                const building = window.roomData[areaId].buildings[buildingName];
-
-                // 查找照明房间ID (支持所有照明相关的单元类型)
-                let lightUnit = null;
-                const units = building.units;
-
-                // 特殊处理洛阳校区(105) - 使用"层"作为单元
-                if (areaId === '105') {
-                    // 洛阳校区每个房间只有一个ID，同时用作照明和空调
-                    const currentUnit = units[unitName];
-                    if (currentUnit) {
-                        const roomIndex = currentUnit.rooms.indexOf(roomNumber);
-                        if (roomIndex !== -1 && currentUnit.ids[roomIndex]) {
-                            const roomId = currentUnit.ids[roomIndex];
-                            currentLightRoomId = roomId;
-                            currentAcRoomId = roomId;
-                            lightRoomResult.textContent = roomId;
-                            acRoomResult.textContent = roomId;
-                            copyLightBtn.disabled = false;
-                            copyAcBtn.disabled = false;
-                        }
-                    }
-                } else {
-                    // 其他校区的正常处理逻辑
-                    // 优先查找照明相关单元
-                    for (const unitName in units) {
-                        if (unitName.includes('照明')) {
-                            lightUnit = units[unitName];
-                            break;
-                        }
-                    }
-
-                    // 如果没有找到照明单元，检查是否有"房间用电"单元
-                    if (!lightUnit && units['房间用电']) {
-                        lightUnit = units['房间用电'];
-                    }
-
-                    if (lightUnit) {
-                        const lightIndex = lightUnit.rooms.indexOf(roomNumber);
-                        if (lightIndex !== -1 && lightUnit.ids[lightIndex]) {
-                            currentLightRoomId = lightUnit.ids[lightIndex];
-                            lightRoomResult.textContent = currentLightRoomId;
-                            copyLightBtn.disabled = false;
-                        }
-                    }
-
-                    // 查找空调房间ID (支持所有空调相关的单元类型)
-                    let acUnit = null;
-
-                    // 优先查找空调相关单元
-                    for (const unitName in units) {
-                        if (unitName.includes('空调')) {
-                            acUnit = units[unitName];
-                            break;
-                        }
-                    }
-
-                    // 如果没有找到空调单元，检查是否有"房间用电"单元
-                    if (!acUnit && units['房间用电']) {
-                        acUnit = units['房间用电'];
-                    }
-
-                    if (acUnit) {
-                        const acIndex = acUnit.rooms.indexOf(roomNumber);
-                        if (acIndex !== -1 && acUnit.ids[acIndex]) {
-                            currentAcRoomId = acUnit.ids[acIndex];
-                            acRoomResult.textContent = currentAcRoomId;
-                            copyAcBtn.disabled = false;
-                        } else {
-                            acRoomResult.textContent = '该房间无空调编号';
-                            copyAcBtn.disabled = true;
-                        }
-                    } else {
-                        acRoomResult.textContent = '该房间无空调编号';
-                        copyAcBtn.disabled = true;
-                    }
-                }
-            } else {
+            if (!units || !selectedUnit || selectedIndex === -1) {
                 clearResults();
+                return;
             }
+
+            if (areaId === '105') {
+                const roomId = getRoomId(selectedUnit, roomNumber, selectedIndex);
+                currentLightRoomId = setRoomResult(lightRoomResult, copyLightBtn, roomId, '该房间无照明编号');
+                currentAcRoomId = setRoomResult(acRoomResult, copyAcBtn, roomId, '该房间无空调编号');
+                return;
+            }
+
+            currentLightRoomId = setRoomResult(
+                lightRoomResult,
+                copyLightBtn,
+                getRoomId(findRoomUnit(units, '照明'), roomNumber, selectedIndex),
+                '该房间无照明编号'
+            );
+            currentAcRoomId = setRoomResult(
+                acRoomResult,
+                copyAcBtn,
+                getRoomId(findRoomUnit(units, '空调'), roomNumber, selectedIndex),
+                '该房间无空调编号'
+            );
         });
     }
 
-    // 复制按钮事件
     if (copyLightBtn) {
         copyLightBtn.addEventListener('click', function() {
             if (currentLightRoomId) {
@@ -1626,7 +1528,6 @@ document.addEventListener('DOMContentLoaded', function() {
         });
     }
 
-    // 工具函数
     function clearResults() {
         lightRoomResult.textContent = '请先选择房间';
         acRoomResult.textContent = '请先选择房间';
@@ -1652,9 +1553,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function fallbackCopyTextToClipboard(text, successMessage) {
         const textArea = document.createElement('textarea');
         textArea.value = text;
-        textArea.style.position = 'fixed';
-        textArea.style.left = '-999999px';
-        textArea.style.top = '-999999px';
+        textArea.className = 'clipboard-buffer';
         document.body.appendChild(textArea);
         textArea.focus();
         textArea.select();

@@ -7,8 +7,7 @@
     <link rel="stylesheet" href="./style.css">
     <link rel="stylesheet" href="https://registry.npmmirror.com/lxgw-wenkai-screen-web/latest/files/lxgwwenkaigbscreen/result.css">
     <link rel="shortcut icon" href="./favicon.ico" type="image/x-icon">
-    <script src="https://registry.npmmirror.com/echarts/6.0.0/files/dist/echarts.min.js"></script>
-    <script src="https://registry.npmmirror.com/echarts-gl/2.0.9/files/dist/echarts-gl.min.js"></script>
+    <script src="https://registry.npmmirror.com/echarts/latest/files/dist/echarts.min.js"></script>
 </head>
 <body>
     <!-- 背景动画 -->
@@ -67,7 +66,7 @@
             <section class="overview">
                 <div class="stat-card glass card-light">
                     <div class="stat-header">
-                        <div class="stat-icon light-icon">💡</div>
+                        <div class="stat-icon">💡</div>
                         <div class="stat-trend" id="light-yesterday-trend">
                             <span class="trend-value">--</span>
                             <span class="trend-label">昨日共消耗</span>
@@ -92,7 +91,7 @@
 
                 <div class="stat-card glass card-ac">
                     <div class="stat-header">
-                        <div class="stat-icon ac-icon">
+                        <div class="stat-icon">
                             ❄️
                         </div>
                         <div class="stat-trend" id="ac-yesterday-trend">
@@ -119,7 +118,7 @@
 
                 <div class="stat-card glass card-info">
                     <div class="stat-header">
-                        <div class="stat-icon info-icon">📊</div>
+                        <div class="stat-icon">📊</div>
                     </div>
                     <div class="stat-body">
                         <div class="info-grid">
@@ -241,7 +240,7 @@
         </footer>
     </div>
 
-    <!-- Toast 通知 -->
+    <!-- 轻提示通知 -->
     <div id="toast" class="toast"></div>
 
     <!-- 年度总结模态框 -->
@@ -261,6 +260,7 @@
                     <div class="report-card-content">
                         <div class="report-card-value" id="report-total">--</div>
                         <div class="report-card-label">全年总用电量</div>
+                        <div class="report-card-sub" id="report-total-year">-- 年</div>
                     </div>
                 </div>
                 <div class="report-card card-light">
@@ -409,7 +409,6 @@
         </div>
     </div>
 
-    <script src="room.js"></script>
     <script src="main.js"></script>
 </body>
 </html>

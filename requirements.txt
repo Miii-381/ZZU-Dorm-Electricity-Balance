@@ -1,5 +1,5 @@
 requests
-zzupy
+zzupy>=7.2.0
 pytz
 tenacity
 cryptography

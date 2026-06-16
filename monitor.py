@@ -1,177 +1,149 @@
-"""
-电量监控模块
-
-负责获取宿舍电量信息
-"""
-import json
+"""查询电量并应用重试策略。"""
 import logging
-from os import makedirs, path
-from typing import Dict, Optional
 
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    wait_chain,
-    wait_fixed,
-    retry_if_exception_type,
 )
-from zzupy.app import CASClient, ECardClient
+from zzupy.app import ECardClient
 
+from auth import CASAuthenticator
 from config import (
-    ACCOUNT, PASSWORD, LIGHT_ROOM, AC_ROOM,
-    TOKEN_FILE, DATA_DIR,
-    RETRY_ATTEMPTS, RETRY_MULTIPLIER, INITIAL_WAIT, MAX_WAIT,
+    INITIAL_WAIT,
+    MAX_WAIT,
+    RETRY_ATTEMPTS,
+    RETRY_MULTIPLIER,
+    get_settings,
 )
-from storage import get_cst_time
 
 logger = logging.getLogger(__name__)
 
+# 可重试的异常按"类名"匹配，刻意不 import zzupy 的具体异常类：
+# 这样即使 zzupy 升级后调整了异常模块路径或重命名了类，本模块也不会因
+# ImportError 而整体崩溃；最坏情况只是某个被改名的异常不再触发重试（安全降级）。
+# 需要扩充时把类名加进集合即可（与 auth.py 中按类名匹配 "MFAError" 的做法一致）。
+RETRYABLE_EXCEPTION_NAMES = frozenset(
+    {
+        # zzupy 抛出的临时性错误
+        "LoginError",
+        "NetworkError",
+        "NotLoggedInError",
+        # requests / urllib3 网络层错误（若 zzupy 不包装而直接透传）
+        "ConnectionError",
+        "Timeout",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "ChunkedEncodingError",
+    }
+)
+
+
+def should_retry_exception(exception: BaseException) -> bool:
+    """按异常类名（含父类）判断是否值得重试，避免与 zzupy 的具体异常类硬耦合。"""
+    return any(
+        klass.__name__ in RETRYABLE_EXCEPTION_NAMES for klass in type(exception).__mro__
+    )
+
 
 def create_retry_decorator(stop_attempts: int = RETRY_ATTEMPTS, wait_strategy=None):
-    """
-    创建统一的重试装饰器
-
-    Args:
-        stop_attempts: 最大重试次数
-        wait_strategy: 等待策略
-
-    Returns:
-        重试装饰器
-    """
+    """创建电量查询重试装饰器。"""
     if wait_strategy is None:
         wait_strategy = wait_exponential(
             multiplier=RETRY_MULTIPLIER,
             min=INITIAL_WAIT,
-            max=MAX_WAIT
+            max=MAX_WAIT,
         )
 
     return retry(
         stop=stop_after_attempt(stop_attempts),
         wait=wait_strategy,
-        retry=retry_if_exception_type(Exception),
-        reraise=True
+        retry=retry_if_exception(should_retry_exception),
+        reraise=True,
     )
-
-
-# 请求重试装饰器（带链式等待）
-request_retry = create_retry_decorator(
-    wait_strategy=wait_chain(
-        wait_fixed(15),
-        wait_fixed(30),
-        wait_exponential(multiplier=1, min=45, max=120)
-    )
-)
-
-
-class TokenManager:
-    """Token 管理器"""
-
-    @staticmethod
-    def save(user_token: str, refresh_token: str) -> None:
-        """保存 token 到文件"""
-        try:
-            token_data = {
-                "user_token": user_token,
-                "refresh_token": refresh_token,
-                "saved_at": get_cst_time()
-            }
-
-            dir_path = path.dirname(TOKEN_FILE)
-            if dir_path and not path.exists(dir_path):
-                makedirs(dir_path, exist_ok=True)
-
-            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-                json.dump(token_data, f, ensure_ascii=False, indent=2)
-
-            logger.info(f"Token 已保存: {TOKEN_FILE}")
-        except Exception as e:
-            logger.error(f"保存 Token 失败: {e}")
-            raise
-
-    @staticmethod
-    def load() -> Optional[Dict[str, str]]:
-        """从文件加载 token"""
-        try:
-            if not path.exists(TOKEN_FILE):
-                logger.info("Token 文件不存在，将使用账号密码登录")
-                return None
-
-            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-                token_data = json.load(f)
-
-            logger.info(f"Token 加载成功，保存时间: {token_data.get('saved_at', '未知')}")
-            return token_data
-
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            logger.warning(f"读取 Token 文件失败: {e}")
-            return None
 
 
 class EnergyMonitor:
-    """电量监控器"""
+    """电量查询入口。"""
 
-    def __init__(self):
-        self.cas_client = CASClient(ACCOUNT, PASSWORD)
+    def __init__(self, authenticator: CASAuthenticator | None = None):
+        self.authenticator = authenticator or CASAuthenticator()
         self.get_balance = create_retry_decorator()(self._get_balance)
 
-    def _init_cas_client(self) -> bool:
-        """初始化 CAS 客户端"""
-        token_data = TokenManager.load()
+    def close(self) -> None:
+        """释放认证客户端资源。"""
+        self.authenticator.close()
 
-        # 尝试使用已保存的 token 登录
-        if token_data and token_data.get("user_token") and token_data.get("refresh_token"):
-            try:
-                logger.info("尝试使用已保存的 Token 登录...")
-                self.cas_client.set_token(
-                    token_data["user_token"],
-                    token_data["refresh_token"]
-                )
-                self.cas_client.login()
-
-                if self.cas_client.logged_in:
-                    logger.info("Token 登录成功")
-                    return True
-                else:
-                    logger.warning("Token 已失效，将使用账号密码登录")
-            except Exception as e:
-                logger.warning(f"Token 登录失败: {e}")
-
-        # 使用账号密码登录
-        logger.info("使用账号密码进行 CAS 认证...")
-        self.cas_client.login()
-
-        if self.cas_client.logged_in:
-            logger.info("CAS 认证成功")
-            try:
-                TokenManager.save(
-                    self.cas_client.user_token,
-                    self.cas_client.refresh_token
-                )
-            except Exception as e:
-                logger.error(f"保存 Token 失败: {e}")
-            return True
-        else:
-            logger.error("CAS 认证失败")
-            return False
-
-    def _get_balance(self) -> Dict[str, float]:
-        """获取电量余额"""
-        if not self._init_cas_client():
-            raise Exception("CAS 认证失败，无法获取电量信息")
-
+    def _open_ecard(self) -> ECardClient:
+        """创建并登录一卡通客户端。"""
+        cas_client = self.authenticator.login()
         logger.info("创建一卡通客户端...")
-        with ECardClient(self.cas_client) as ecard:
+        ecard = ECardClient(cas_client)
+        enter = getattr(ecard, "__enter__", None)
+        if enter is not None:
+            ecard = enter()
+        try:
             ecard.login()
             logger.info("一卡通登录成功")
+            return ecard
+        except Exception:
+            self._close_ecard(ecard)
+            raise
 
-            logger.info("获取电量余额...")
-            light_balance = ecard.get_remaining_energy(room=LIGHT_ROOM)
-            ac_balance = ecard.get_remaining_energy(room=AC_ROOM)
+    def _close_ecard(self, ecard: ECardClient) -> None:
+        """关闭一卡通客户端。"""
+        exit_method = getattr(ecard, "__exit__", None)
+        if exit_method is not None:
+            exit_method(None, None, None)
+            return
 
-            logger.info(f"照明: {light_balance} 度, 空调: {ac_balance} 度")
+        close = getattr(ecard, "close", None)
+        if close is not None:
+            close()
 
-            return {
-                "light_Balance": light_balance,
-                "ac_Balance": ac_balance
-            }
+    def _get_room_balance(
+        self,
+        ecard: ECardClient,
+        room_name: str,
+        room_id: str,
+    ) -> tuple[float, ECardClient]:
+        """查询单个房间，认证失效时刷新登录态后重试一次。"""
+        try:
+            return ecard.get_remaining_energy(room=room_id), ecard
+        except Exception as e:
+            if not should_retry_exception(e):
+                raise
+            logger.warning(f"{room_name} 查询失败，刷新登录态后重试: {e}")
+            self._close_ecard(ecard)
+            refreshed_ecard = self._open_ecard()
+            try:
+                return refreshed_ecard.get_remaining_energy(room=room_id), refreshed_ecard
+            except Exception:
+                self._close_ecard(refreshed_ecard)
+                raise
+
+    def _get_balance(self) -> dict[str, float]:
+        """获取电量余额。"""
+        settings = get_settings()
+        if settings.light_room is None or settings.ac_room is None:
+            raise RuntimeError("缺少房间环境变量")
+
+        logger.info("获取电量余额...")
+        ecard = self._open_ecard()
+        try:
+            light_balance, ecard = self._get_room_balance(
+                ecard, "照明", settings.light_room,
+            )
+            ac_balance, ecard = self._get_room_balance(
+                ecard, "空调", settings.ac_room,
+            )
+        finally:
+            self._close_ecard(ecard)
+
+        logger.info(f"照明: {light_balance} 度, 空调: {ac_balance} 度")
+
+        return {
+            "light_Balance": light_balance,
+            "ac_Balance": ac_balance,
+        }

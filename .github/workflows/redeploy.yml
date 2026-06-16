@@ -1,14 +1,12 @@
-name: Redeploy
+name: Redeploy Pages
 
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 concurrency:
-  group: "pages"
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -19,46 +17,76 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pages: write
-      id-token: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
-      - name: Clone page branch
+      - name: Restore persisted data
         run: |
-          # 克隆 page 分支（仅克隆最新版本）
-          git clone --depth=1 --branch=page https://github.com/${{ github.repository }}.git /tmp/repo
-          # 复制 data 文件夹内容到目标目录
-          cp -r /tmp/repo/data/* ./page/data/
-          # 清理临时文件
-          rm -rf /tmp/repo
+          set -euo pipefail
+          repo_url="https://github.com/${{ github.repository }}.git"
+          target_branch="page"
+
+          if git ls-remote --heads "$repo_url" "$target_branch" | grep -q "refs/heads/${target_branch}$"; then
+            clone_dir="$(mktemp -d)"
+            echo "发现 ${target_branch} 分支，正在读取持久化数据..."
+            git clone --depth=1 --branch="$target_branch" "$repo_url" "$clone_dir"
+
+            if [ -d "$clone_dir/data" ]; then
+              mkdir -p ./page/data
+              shopt -s dotglob nullglob
+              for item in "$clone_dir/data"/*; do
+                if [ "$(basename "$item")" = "rooms" ]; then
+                  continue
+                fi
+                cp -r "$item" ./page/data/
+              done
+              echo "已恢复 ${target_branch} 分支的 data 内容"
+            else
+              echo "${target_branch} 分支中未找到 data 目录"
+            fi
+
+            rm -rf "$clone_dir"
+          else
+            echo "${target_branch} 分支不存在，跳过数据恢复"
+          fi
 
       - name: git config
+        if: github.ref == 'refs/heads/main'
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
 
       - name: Commit changes
+        if: github.ref == 'refs/heads/main'
         run: |
+          set -euo pipefail
           mkdir pages
-          cp -r ./page/data ./page/favicon.ico ./page/index.html ./page/style.css ./page/README.md pages/
+          cp -r ./page/data ./page/favicon.ico ./page/index.html ./page/style.css ./page/main.js pages/
+          rm -f pages/data/tokens.json pages/data/mfa.json
           cd pages
           git init
           git add .
           git commit -m "🔄 $(date +"%Y年%m月%d日-%H时%M分") 重新部署"
           git push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:page
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v4
+      - name: Remove auth files from workspace and Pages artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f ./page/data/tokens.json ./page/data/tokens.enc ./page/data/mfa.json ./page/data/mfa.enc
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
         with:
           path: './page'
 
   deploy:
+    if: github.ref == 'refs/heads/main'
     needs: redeploy
     permissions:
       pages: write
@@ -70,4 +98,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

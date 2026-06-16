@@ -1,4 +1,4 @@
-/* ==================== CSS 变量 ==================== */
+/* ==================== 样式变量 ==================== */
 :root,
 [data-theme="light"] {
     --bg-primary: #f0f4f8;
@@ -63,6 +63,10 @@ body {
     min-height: 100vh;
     overflow-x: hidden;
     transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+body.modal-open {
+    overflow: hidden;
 }
 
 /* ==================== 背景动画 ==================== */
@@ -333,12 +337,6 @@ body {
     margin-right: auto;
 }
 
-.stat-trend-group {
-    display: flex;
-    flex-direction: row;
-    gap: 6px;
-}
-
 .stat-trend {
     display: flex;
     flex-direction: column;
@@ -358,8 +356,17 @@ body {
     color: var(--text-muted);
 }
 
-.trend-up .trend-value { color: var(--success-color); }
-.trend-down .trend-value { color: var(--danger-color); }
+.stat-trend[data-trend="up"] .trend-value {
+    color: var(--accent-ac);
+}
+
+.stat-trend[data-trend="down"] .trend-value {
+    color: var(--accent-danger);
+}
+
+.stat-trend[data-trend="flat"] .trend-value {
+    color: var(--text-muted);
+}
 
 .stat-body {
     margin-bottom: 16px;
@@ -397,6 +404,7 @@ body {
 
 .progress-fill {
     height: 100%;
+    width: var(--progress, 0%);
     border-radius: 3px;
     transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -410,29 +418,25 @@ body {
     padding: 4px 10px;
     border-radius: 20px;
     white-space: nowrap;
+    transition: background 0.2s ease, color 0.2s ease;
 }
 
-.status-good {
+.stat-status[data-state="good"] {
     background: rgba(16, 185, 129, 0.15);
     color: var(--accent-ac);
 }
 
-.status-normal {
-    background: rgba(59, 130, 246, 0.15);
-    color: var(--accent-light);
-}
-
-.status-warning {
+.stat-status[data-state="warning"] {
     background: rgba(245, 158, 11, 0.15);
     color: var(--accent-warning);
 }
 
-.status-danger {
+.stat-status[data-state="danger"] {
     background: rgba(239, 68, 68, 0.15);
     color: var(--accent-danger);
 }
 
-/* 信息卡片 */
+/* ==================== 信息卡片 ==================== */
 .info-grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
@@ -539,52 +543,6 @@ body {
     background: var(--card-bg-solid);
     color: var(--accent-light);
     box-shadow: var(--shadow-sm);
-}
-
-.switch-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.switch {
-    display: none;
-}
-
-.switch-label {
-    width: 40px;
-    height: 22px;
-    background: var(--border-color);
-    border-radius: 11px;
-    position: relative;
-    cursor: pointer;
-    transition: background 0.3s ease;
-}
-
-.switch-label::after {
-    content: '';
-    position: absolute;
-    width: 18px;
-    height: 18px;
-    background: white;
-    border-radius: 50%;
-    top: 2px;
-    left: 2px;
-    transition: transform 0.3s ease;
-    box-shadow: var(--shadow-sm);
-}
-
-.switch:checked + .switch-label {
-    background: var(--accent-light);
-}
-
-.switch:checked + .switch-label::after {
-    transform: translateX(18px);
-}
-
-.switch-wrapper span {
-    font-size: 12px;
-    color: var(--text-secondary);
 }
 
 /* ==================== 图表区域 ==================== */
@@ -712,7 +670,7 @@ body {
     opacity: 0.8;
 }
 
-/* ==================== Toast 通知 ==================== */
+/* ==================== 轻提示通知 ==================== */
 .toast {
     position: fixed;
     bottom: 24px;
@@ -745,6 +703,12 @@ body {
 
 .toast-info {
     border-left: 4px solid var(--accent-light);
+}
+
+.clipboard-buffer {
+    position: fixed;
+    left: -999999px;
+    top: -999999px;
 }
 
 /* ==================== 响应式 ==================== */
@@ -888,6 +852,11 @@ body {
     display: block;
 }
 
+.modal.is-exporting .modal-close,
+.modal.is-exporting .btn-export {
+    display: none;
+}
+
 .modal-overlay {
     position: fixed;
     top: 0;
@@ -955,14 +924,6 @@ body {
     flex-wrap: wrap;
 }
 
-.report-title-icon,
-.report-title-text {
-    background: linear-gradient(135deg, var(--accent-light), var(--accent-ac));
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
-}
-
 .year-select {
     font-size: 28px;
     font-weight: 800;
@@ -995,7 +956,7 @@ body {
     color: var(--text-muted);
 }
 
-/* 报告卡片 */
+/* ==================== 报告卡片 ==================== */
 .report-cards {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
@@ -1067,7 +1028,7 @@ body {
     border-color: rgba(245, 158, 11, 0.2);
 }
 
-/* 报告区块 */
+/* ==================== 报告区块 ==================== */
 .report-section {
     margin-bottom: 32px;
     padding: 24px;
@@ -1093,7 +1054,7 @@ body {
     height: 400px;
 }
 
-/* 导出按钮 */
+/* ==================== 导出按钮 ==================== */
 .report-actions {
     display: flex;
     justify-content: center;
@@ -1125,7 +1086,7 @@ body {
     transform: translateY(0);
 }
 
-/* 响应式 - 模态框 */
+/* ==================== 响应式：模态框 ==================== */
 @media (max-width: 1024px) {
     .report-cards {
         grid-template-columns: repeat(2, 1fr);
@@ -1172,7 +1133,7 @@ body {
     }
 }
 
-/* ==================== 房间查询器样式 ==================== */
+/* ==================== 房间查询器 ==================== */
 .room-query-form {
     padding: 0;
 }
@@ -1310,7 +1271,7 @@ body {
     line-height: 1.5;
 }
 
-/* 响应式 - 房间查询器 */
+/* ==================== 响应式：房间查询器 ==================== */
 @media (max-width: 768px) {
     .query-row {
         grid-template-columns: 1fr;

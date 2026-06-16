@@ -1,0 +1,226 @@
+name: Update Data
+
+on:
+  # 默认手动触发；需要定时运行时启用 schedule。
+  # GitHub Actions 的 schedule 可能延迟 10-60 分钟。
+  # schedule:
+  #   - cron: '0 16,20,0,4,8,12 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  AUTH_DATA_BRANCH: page
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+          check-latest: true
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Restore persisted data
+        run: |
+          set -euo pipefail
+          repo_url="https://github.com/${{ github.repository }}.git"
+          target_branch="$AUTH_DATA_BRANCH"
+
+          if git ls-remote --heads "$repo_url" "$target_branch" | grep -q "refs/heads/${target_branch}$"; then
+            clone_dir="$(mktemp -d)"
+            echo "发现 ${target_branch} 分支，正在读取持久化数据..."
+            git clone --depth=1 --branch="$target_branch" "$repo_url" "$clone_dir"
+
+            if [ -d "$clone_dir/data" ]; then
+              mkdir -p ./page/data
+              shopt -s dotglob nullglob
+              for item in "$clone_dir/data"/*; do
+                if [ "$(basename "$item")" = "rooms" ]; then
+                  continue
+                fi
+                cp -r "$item" ./page/data/
+              done
+              echo "已恢复 ${target_branch} 分支的 data 内容"
+            else
+              echo "${target_branch} 分支中未找到 data 目录"
+            fi
+
+            rm -rf "$clone_dir"
+          else
+            echo "${target_branch} 分支不存在，跳过数据恢复"
+          fi
+
+      - name: Decrypt tokens.enc if exists
+        env:
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          if [ -f "./page/data/tokens.enc" ]; then
+            echo "🔐 解密 tokens.enc ..."
+            python3 ./auth.py decrypt
+          else
+            echo "ℹ️ 未检测到加密文件，跳过解密步骤"
+          fi
+
+      - name: Run python script
+        env:
+          ACCOUNT: ${{ secrets.ACCOUNT }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          LIGHT_ROOM: ${{ secrets.LIGHT_ROOM }}
+          AC_ROOM: ${{ secrets.AC_ROOM }}
+          ZZU_DEVICE_ID: ${{ secrets.ZZU_DEVICE_ID }}
+          NOTIFY_DEDUP: ${{ secrets.NOTIFY_DEDUP }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          EMAIL: ${{ secrets.EMAIL }}
+          SMTP_CODE: ${{ secrets.SMTP_CODE }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          BARK_URL: ${{ secrets.BARK_URL }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          GOCQHTTP_URL: ${{ secrets.GOCQHTTP_URL }}
+          GOCQHTTP_TOKEN: ${{ secrets.GOCQHTTP_TOKEN }}
+          GOCQHTTP_TARGET: ${{ secrets.GOCQHTTP_TARGET }}
+          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+          IGOT_KEY: ${{ secrets.IGOT_KEY }}
+          PUSHDEER_KEY: ${{ secrets.PUSHDEER_KEY }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
+          WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
+          CHANIFY_TOKEN: ${{ secrets.CHANIFY_TOKEN }}
+          CHANIFY_URL: ${{ secrets.CHANIFY_URL }}
+          SYNOLOGY_CHAT_URL: ${{ secrets.SYNOLOGY_CHAT_URL }}
+          SYNOLOGY_CHAT_TOKEN: ${{ secrets.SYNOLOGY_CHAT_TOKEN }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WECOM_CORP_ID: ${{ secrets.WECOM_CORP_ID }}
+          WECOM_AGENT_ID: ${{ secrets.WECOM_AGENT_ID }}
+          WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
+          WECOM_TOUSER: ${{ secrets.WECOM_TOUSER }}
+          WECOM_BOT_WEBHOOK: ${{ secrets.WECOM_BOT_WEBHOOK }}
+          QMSG_KEY: ${{ secrets.QMSG_KEY }}
+          QMSG_QQ: ${{ secrets.QMSG_QQ }}
+          AIBOTK_KEY: ${{ secrets.AIBOTK_KEY }}
+          AIBOTK_TARGET: ${{ secrets.AIBOTK_TARGET }}
+          PUSHME_KEY: ${{ secrets.PUSHME_KEY }}
+          CHRONOCAT_URL: ${{ secrets.CHRONOCAT_URL }}
+          CHRONOCAT_TOKEN: ${{ secrets.CHRONOCAT_TOKEN }}
+          CHRONOCAT_TARGET: ${{ secrets.CHRONOCAT_TARGET }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          TEAMS_WEBHOOK: ${{ secrets.TEAMS_WEBHOOK }}
+          MATRIX_HOMESERVER: ${{ secrets.MATRIX_HOMESERVER }}
+          MATRIX_ACCESS_TOKEN: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          MATRIX_ROOM_ID: ${{ secrets.MATRIX_ROOM_ID }}
+          MATRIX_MSGTYPE: ${{ secrets.MATRIX_MSGTYPE }}
+          XIZHI_TOKEN: ${{ secrets.XIZHI_TOKEN }}
+          XIZHI_URL: ${{ secrets.XIZHI_URL }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_DEVICE: ${{ secrets.PUSHOVER_DEVICE }}
+          PUSHOVER_PRIORITY: ${{ secrets.PUSHOVER_PRIORITY }}
+          PUSHOVER_SOUND: ${{ secrets.PUSHOVER_SOUND }}
+          PUSHOVER_URL: ${{ secrets.PUSHOVER_URL }}
+          PUSHOVER_URL_TITLE: ${{ secrets.PUSHOVER_URL_TITLE }}
+          PUSHOVER_RETRY: ${{ secrets.PUSHOVER_RETRY }}
+          PUSHOVER_EXPIRE: ${{ secrets.PUSHOVER_EXPIRE }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_METHOD: ${{ secrets.WEBHOOK_METHOD }}
+          WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
+          WEBHOOK_BODY_TEMPLATE: ${{ secrets.WEBHOOK_BODY_TEMPLATE }}
+        run: |
+          python3 ./main.py
+
+      - name: Encrypt tokens.json
+        env:
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          if [ -f "./page/data/tokens.json" ]; then
+            echo "🔐 加密 tokens.json ..."
+            python3 ./auth.py encrypt
+            echo "🧹 删除原始 tokens.json ..."
+            rm -f ./page/data/tokens.json
+          else
+            echo "⚠️ 未找到 tokens.json，跳过加密步骤"
+          fi
+
+      - name: git config
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Commit changes
+        run: |
+          set -euo pipefail
+          mkdir pages
+          cp -r ./page/data ./page/favicon.ico ./page/index.html ./page/style.css ./page/main.js pages/
+          rm -f pages/data/tokens.json pages/data/mfa.json
+          cd pages
+          git init
+          git add .
+          git commit -m "⏱️ $(date +"%Y年%m月%d日-%H时%M分") GitHub Actions定时更新"
+          git push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${AUTH_DATA_BRANCH}
+
+      - name: Remove auth files from workspace and Pages artifact
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f ./page/data/tokens.json ./page/data/tokens.enc ./page/data/mfa.json ./page/data/mfa.enc
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: './page'
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
+
+  keepalive-workflow:
+    name: Keepalive Workflow
+    if: ${{ always() }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Keep workflow active
+        uses: liskin/gh-workflow-keepalive@v1

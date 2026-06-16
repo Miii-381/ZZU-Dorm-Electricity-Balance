@@ -1,0 +1,99 @@
+name: CI Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+          check-latest: true
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+          pip install ruff mypy types-requests types-pytz
+
+      - name: Python syntax check
+        run: |
+          python -m py_compile config.py auth.py data.py monitor.py main.py notify.py
+
+      - name: Lint (ruff)
+        run: |
+          ruff check \
+            --line-length 120 \
+            --select E4,E7,E9,F,I,B,UP,SIM \
+            .
+
+      - name: Type check (mypy)
+        run: |
+          mypy \
+            --check-untyped-defs \
+            --warn-unused-ignores \
+            --no-implicit-optional \
+            --ignore-missing-imports \
+            .
+
+      - name: JavaScript syntax check
+        run: |
+          node --check page/main.js
+
+      - name: Check workflow safety
+        run: |
+          if grep -R -n -E \
+            -e 'pull_request_''target' \
+            -e 'permissions:[[:space:]]*write-all' \
+            -e 'Mattraks/delete-workflow-''runs' \
+            .github/workflows; then
+            echo "Unsafe workflow configuration was found"
+            exit 1
+          fi
+
+      - name: Validate room JSON shards
+        run: |
+          found=0
+          for file in page/data/rooms/*.json; do
+            [ -e "$file" ] || continue
+            found=1
+            python -m json.tool "$file" > /dev/null
+          done
+          if [ "$found" -ne 1 ]; then
+            echo "No room JSON shards found"
+            exit 1
+          fi
+
+      - name: Check whitespace
+        run: |
+          git diff --check
+
+      - name: Check generated and auth files
+        run: |
+          find . -type d -name __pycache__ -prune -exec rm -rf {} +
+          if find . -path ./.git -prune -o \( -name '*.pyc' -o -name tokens.json -o -name tokens.enc -o -name mfa.json -o -name mfa.enc -o -name '.env' \) -print | grep -q .; then
+            echo "Generated, local env, or auth files were found"
+            find . -path ./.git -prune -o \( -name '*.pyc' -o -name tokens.json -o -name tokens.enc -o -name mfa.json -o -name mfa.enc -o -name '.env' \) -print
+            exit 1
+          fi

@@ -1,0 +1,139 @@
+name: Refresh MFA Token
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '操作：request 发送验证码，verify 输入验证码完成初始化'
+        required: true
+        default: request
+        type: choice
+        options:
+          - request
+          - verify
+      code:
+        description: '短信验证码，仅 verify 模式填写'
+        required: false
+
+concurrency:
+  group: mfa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Shanghai
+  AUTH_DATA_BRANCH: page
+
+jobs:
+  mfa:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+          check-latest: true
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -r requirements.txt
+
+      - name: Restore persisted data
+        run: |
+          set -euo pipefail
+          repo_url="https://github.com/${{ github.repository }}.git"
+          target_branch="$AUTH_DATA_BRANCH"
+          clone_dir="/tmp/page"
+
+          rm -rf "$clone_dir"
+          if git ls-remote --heads "$repo_url" "$target_branch" | grep -q "refs/heads/${target_branch}$"; then
+            echo "发现 ${target_branch} 分支，正在读取持久化数据..."
+            git clone --depth=1 --branch="$target_branch" "$repo_url" "$clone_dir"
+          else
+            echo "${target_branch} 分支不存在，初始化新的持久化分支..."
+            mkdir -p "$clone_dir"
+            git -C "$clone_dir" init
+            git -C "$clone_dir" checkout -b "$target_branch"
+            cp -r ./page/. "$clone_dir"/
+            rm -f "$clone_dir"/data/tokens.json "$clone_dir"/data/tokens.enc \
+              "$clone_dir"/data/mfa.json "$clone_dir"/data/mfa.enc
+          fi
+
+          if [ -d "$clone_dir/data" ]; then
+            mkdir -p ./page/data
+            shopt -s dotglob nullglob
+            for item in "$clone_dir/data"/*; do
+              if [ "$(basename "$item")" = "rooms" ]; then
+                continue
+              fi
+              cp -r "$item" ./page/data/
+            done
+            echo "已恢复 ${target_branch} 分支的 data 内容"
+          else
+            echo "${target_branch} 分支中未找到 data 目录"
+          fi
+
+      - name: Run MFA
+        env:
+          ACCOUNT: ${{ secrets.ACCOUNT }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          ZZU_DEVICE_ID: ${{ secrets.ZZU_DEVICE_ID }}
+          MFA_CODE: ${{ inputs.code }}
+        run: |
+          if [ -n "$MFA_CODE" ]; then
+            echo "::add-mask::$MFA_CODE"
+          fi
+          python3 ./auth.py "${{ inputs.mode }}"
+
+      - name: Encrypt tokens.json if exists
+        env:
+          PASSWORD: ${{ secrets.PASSWORD }}
+        run: |
+          if [ -f "./page/data/tokens.json" ]; then
+            echo "加密 tokens.json ..."
+            python3 ./auth.py encrypt
+          fi
+          rm -f ./page/data/tokens.json ./page/data/mfa.json
+
+      - name: Persist auth data to page branch
+        run: |
+          mkdir -p /tmp/page/data
+
+          if [ -f "./page/data/tokens.enc" ]; then
+            cp ./page/data/tokens.enc /tmp/page/data/tokens.enc
+            rm -f /tmp/page/data/mfa.enc
+          fi
+
+          # 保存 MFA 验证状态时保留已有 tokens.enc：request→verify 期间
+          # 定时更新仍可用旧 token 登录，误触 request 也不会弄丢有效 token。
+          # （verify 成功后上面的 tokens.enc 分支会清掉残留的 mfa.enc。）
+          if [ -f "./page/data/mfa.enc" ]; then
+            cp ./page/data/mfa.enc /tmp/page/data/mfa.enc
+          fi
+
+          rm -f /tmp/page/data/tokens.json /tmp/page/data/mfa.json
+
+          rm -rf /tmp/page/.git
+          git -C /tmp/page init
+          git -C /tmp/page checkout -b "$AUTH_DATA_BRANCH"
+          git -C /tmp/page config user.name 'github-actions[bot]'
+          git -C /tmp/page config user.email 'github-actions[bot]@users.noreply.github.com'
+          git -C /tmp/page add .
+          git -C /tmp/page commit -m "🔐 $(date +"%Y年%m月%d日-%H时%M分") MFA 初始化"
+          git -C /tmp/page push --force https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${AUTH_DATA_BRANCH}
+
+      - name: Remove auth files from workspace
+        if: always()
+        run: |
+          rm -f ./page/data/tokens.json ./page/data/tokens.enc ./page/data/mfa.json ./page/data/mfa.enc

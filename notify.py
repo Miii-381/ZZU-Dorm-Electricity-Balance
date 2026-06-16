@@ -1,279 +1,219 @@
-"""
-通知模块 - 支持 20+ 通知渠道
-
-通知逻辑:
-- Telegram: 每次运行都发送
-- 其他渠道: 仅在电量低于阈值时发送
-"""
+"""注册通知渠道并按电量状态调度发送。"""
 import json
 import logging
+import os
 import smtplib
+from collections.abc import Callable
+from dataclasses import dataclass
 from email.mime.text import MIMEText
-from typing import Dict, Optional, Callable
-from urllib.parse import urlencode
+from urllib.parse import quote
+from uuid import uuid4
 
 import requests
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_chain,
-    wait_fixed,
-    wait_exponential,
-    retry_if_exception_type,
-)
 
-from config import (
-    THRESHOLD,
-    EXCELLENT_THRESHOLD,
-    RETRY_ATTEMPTS,
-    # 通知渠道配置
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
-    SERVERCHAN_KEYS,
-    EMAIL,
-    SMTP_CODE,
-    SMTP_SERVER,
-    BARK_URL,
-    BARK_KEY,
-    DINGTALK_WEBHOOK,
-    DINGTALK_SECRET,
-    FEISHU_WEBHOOK,
-    FEISHU_SECRET,
-    GOCQHTTP_URL,
-    GOCQHTTP_TOKEN,
-    GOCQHTTP_TARGET,
-    GOTIFY_URL,
-    GOTIFY_TOKEN,
-    IGOT_KEY,
-    PUSHDEER_KEY,
-    SYNOLOGY_CHAT_URL,
-    SYNOLOGY_CHAT_TOKEN,
-    PUSHPLUS_TOKEN,
-    WECOM_CORP_ID,
-    WECOM_AGENT_ID,
-    WECOM_SECRET,
-    WECOM_TOUSER,
-    QMSG_KEY,
-    QMSG_QQ,
-    AIBOTK_KEY,
-    AIBOTK_TARGET,
-    PUSHME_KEY,
-    CHRONOCAT_URL,
-    CHRONOCAT_TOKEN,
-    CHRONOCAT_TARGET,
-    NTFY_URL,
-    NTFY_TOPIC,
-    NTFY_TOKEN,
-    WEBHOOK_URL,
-    WEBHOOK_METHOD,
-    WEBHOOK_HEADERS,
-    WEBHOOK_BODY_TEMPLATE,
-)
+from config import EXCELLENT_THRESHOLD, REQUEST_TIMEOUT, THRESHOLD, get_settings
+from data import get_cst_time, load_notify_state, save_notify_state
 
 logger = logging.getLogger(__name__)
 
-# 请求重试装饰器
-request_retry = retry(
-    stop=stop_after_attempt(RETRY_ATTEMPTS),
-    wait=wait_chain(
-        wait_fixed(15),
-        wait_fixed(30),
-        wait_exponential(multiplier=1, min=45, max=120),
-    ),
-    retry=retry_if_exception_type(Exception),
-    reraise=True,
-)
+
+class NotifyError(RuntimeError):
+    """通知渠道返回失败响应。"""
 
 
-def get_status(balance: float) -> str:
-    """获取电量状态描述"""
-    if balance > EXCELLENT_THRESHOLD:
-        return "充足"
-    elif balance > THRESHOLD:
-        return "偏低"
-    else:
-        return "不足"
+SendFunc = Callable[[dict[str, str], str, str], None]
 
 
-def format_balance_report(
-    light_balance: float, ac_balance: float, escape_markdown: bool = False
-) -> str:
-    """
-    格式化电量报告
+@dataclass(frozen=True)
+class Channel:
+    """通知渠道声明。"""
 
-    Args:
-        light_balance: 照明电量
-        ac_balance: 空调电量
-        escape_markdown: 是否转义 Markdown 特殊字符 (用于 Telegram)
-
-    Returns:
-        格式化的报告字符串
-    """
-    light_status = get_status(light_balance)
-    ac_status = get_status(ac_balance)
-
-    light_str = str(light_balance)
-    ac_str = str(ac_balance)
-
-    if escape_markdown:
-        light_str = light_str.replace(".", "\\.")
-        ac_str = ac_str.replace(".", "\\.")
-
-    return (
-        f"💡 照明剩余电量：{light_str} 度（{light_status}）\n"
-        f"❄️ 空调剩余电量：{ac_str} 度（{ac_status}）\n\n"
-    )
+    name: str
+    send: SendFunc
+    required: tuple[str, ...]
+    optional: tuple[str, ...] = ()
+    # True 表示每次运行发送；False 只在低电量时发送。
+    daily: bool = False
 
 
-def is_low_energy(balances: Dict[str, float]) -> bool:
-    """判断是否低电量"""
-    return balances["light_Balance"] <= THRESHOLD or balances["ac_Balance"] <= THRESHOLD
+CHANNELS: dict[str, Channel] = {}
 
 
-# ==================== 通知渠道实现 ====================
+def channel(
+    name: str,
+    required: tuple[str, ...],
+    optional: tuple[str, ...] = (),
+    daily: bool = False,
+):
+    """注册通知渠道。"""
+
+    def register(func: SendFunc) -> SendFunc:
+        CHANNELS[name] = Channel(
+            name=name,
+            send=func,
+            required=required,
+            optional=optional,
+            daily=daily,
+        )
+        return func
+
+    return register
 
 
-@request_retry
-def send_telegram(title: str, content: str) -> bool:
-    """Telegram 通知"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.debug("未配置 Telegram 参数，跳过")
+def _has_config_value(value: str | None) -> bool:
+    """判断环境变量是否提供了有效内容。"""
+    return bool(value and value.strip(" ,"))
+
+
+def channel_config(ch: Channel) -> dict[str, str] | None:
+    """读取渠道环境变量。"""
+    values = {key: os.getenv(key) for key in (*ch.required, *ch.optional)}
+    if any(not _has_config_value(values[key]) for key in ch.required):
+        return None
+    return {key: value for key, value in values.items() if value}
+
+
+def dispatch(ch: Channel, title: str, content: str) -> bool:
+    """发送单个渠道通知。"""
+    cfg = channel_config(ch)
+    if cfg is None:
+        logger.debug(f"未配置 {ch.name} 参数，跳过")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    ch.send(cfg, title, content)
+    logger.info(f"{ch.name} 通知发送成功")
+    return True
+
+
+def _json_or_raise(response: requests.Response) -> dict:
+    """解析 JSON 响应。"""
+    try:
+        return response.json()
+    except ValueError as e:
+        raise NotifyError(f"非 JSON 响应: {response.text[:200]}") from e
+
+
+# Telegram MarkdownV2 官方保留字符。
+_MARKDOWN_V2_RESERVED = "_*[]()~`>#+-=|{}.!"
+
+
+def escape_markdown_v2(text: str) -> str:
+    """转义 Telegram MarkdownV2 文本。"""
+    return "".join(f"\\{c}" if c in _MARKDOWN_V2_RESERVED else c for c in text)
+
+
+def split_csv(value: str | None) -> list[str]:
+    """拆分逗号分隔配置。"""
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def split_csv_int(value: str | None, field_name: str) -> list[int]:
+    """拆分逗号分隔数字配置。"""
+    result = []
+    for item in split_csv(value):
+        try:
+            result.append(int(item))
+        except ValueError as e:
+            raise NotifyError(f"{field_name} 必须是数字: {item}") from e
+    return result
+
+
+# 通知渠道
+
+
+@channel(
+    "Telegram",
+    required=("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"),
+    daily=True,
+)
+def send_telegram(cfg: dict[str, str], title: str, content: str) -> None:
+    url = f"https://api.telegram.org/bot{cfg['TELEGRAM_BOT_TOKEN']}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": f"*{title}*\n\n{content}",
+        "chat_id": cfg["TELEGRAM_CHAT_ID"],
+        "text": f"*{escape_markdown_v2(title)}*\n\n{escape_markdown_v2(content)}",
         "parse_mode": "MarkdownV2",
     }
-    response = requests.post(url, data=payload, timeout=10)
-    result = response.json()
-
+    result = _json_or_raise(requests.post(url, data=payload, timeout=REQUEST_TIMEOUT))
     if not result.get("ok"):
-        raise requests.exceptions.RequestException(result.get("description"))
-    logger.info("Telegram 通知发送成功")
-    return True
+        raise NotifyError(result.get("description"))
 
 
-@request_retry
-def send_serverchan(title: str, content: str) -> bool:
-    """Server酱 通知"""
-    if not SERVERCHAN_KEYS:
-        logger.debug("未配置 SERVERCHAN_KEYS，跳过")
-        return False
-
-    success = False
-    for key in SERVERCHAN_KEYS.split(","):
-        key = key.strip()
-        if not key:
-            continue
-
-        url = f"https://sctapi.ftqq.com/{key}.send"
-        payload = {"title": title, "desp": content}
-        response = requests.post(url, data=payload, timeout=10)
-
-        try:
-            result = response.json()
-            if result.get("code") == 0:
-                logger.info(f"Server酱 通知发送成功 (key: {key[:8]}...)")
-                success = True
-            else:
-                logger.warning(f"Server酱 发送失败: {result.get('message')}")
-        except ValueError:
-            logger.error(f"Server酱 返回非 JSON: {response.text}")
-
-    return success
+@channel("Server酱", required=("SERVERCHAN_KEY",))
+def send_serverchan(cfg: dict[str, str], title: str, content: str) -> None:
+    result = _json_or_raise(
+        requests.post(
+            f"https://sctapi.ftqq.com/{cfg['SERVERCHAN_KEY']}.send",
+            data={"title": title, "desp": content},
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("code") != 0:
+        raise NotifyError(result.get("message"))
 
 
-@request_retry
-def send_email(title: str, content: str) -> bool:
-    """邮件通知"""
-    if not all([EMAIL, SMTP_CODE, SMTP_SERVER]):
-        logger.debug("邮件配置不完整，跳过")
-        return False
-
+@channel("邮件", required=("EMAIL", "SMTP_CODE", "SMTP_SERVER"))
+def send_email(cfg: dict[str, str], title: str, content: str) -> None:
     msg = MIMEText(content, "plain", "utf-8")
     msg["Subject"] = title
-    msg["From"] = EMAIL
-    msg["To"] = EMAIL
+    msg["From"] = cfg["EMAIL"]
+    msg["To"] = cfg["EMAIL"]
 
-    client = smtplib.SMTP_SSL(SMTP_SERVER, smtplib.SMTP_SSL_PORT)
-    client.login(EMAIL, SMTP_CODE)
-    client.sendmail(EMAIL, EMAIL, msg.as_string())
-    client.quit()
-    logger.info("邮件通知发送成功")
-    return True
-
-
-@request_retry
-def send_bark(title: str, content: str) -> bool:
-    """Bark 通知 (iOS)"""
-    if not BARK_KEY:
-        logger.debug("未配置 BARK_KEY，跳过")
-        return False
-
-    base_url = BARK_URL or "https://api.day.app"
-    url = f"{base_url}/{BARK_KEY}/{title}/{content}"
-    response = requests.get(url, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 200:
-        logger.info("Bark 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("message"))
+    client = smtplib.SMTP_SSL(cfg["SMTP_SERVER"], smtplib.SMTP_SSL_PORT)
+    try:
+        client.login(cfg["EMAIL"], cfg["SMTP_CODE"])
+        client.sendmail(cfg["EMAIL"], cfg["EMAIL"], msg.as_string())
+    finally:
+        client.quit()
 
 
-@request_retry
-def send_dingtalk(title: str, content: str) -> bool:
-    """钉钉机器人通知"""
-    if not DINGTALK_WEBHOOK:
-        logger.debug("未配置 DINGTALK_WEBHOOK，跳过")
-        return False
+@channel("Bark", required=("BARK_KEY",), optional=("BARK_URL",))
+def send_bark(cfg: dict[str, str], title: str, content: str) -> None:
+    base_url = cfg.get("BARK_URL", "https://api.day.app").rstrip("/")
+    # title/content 含换行、中文、emoji，必须整体 URL 编码（safe="" 连 / 也编码），
+    # 否则拼进 GET 路径会被截断或被 urllib3 判为非法 URL。
+    url = f"{base_url}/{cfg['BARK_KEY']}/{quote(title, safe='')}/{quote(content, safe='')}"
+    result = _json_or_raise(requests.get(url, timeout=REQUEST_TIMEOUT))
+    if result.get("code") != 200:
+        raise NotifyError(result.get("message"))
 
-    url = DINGTALK_WEBHOOK
-    if DINGTALK_SECRET:
-        import time
-        import hmac
-        import hashlib
+
+@channel("钉钉", required=("DINGTALK_WEBHOOK",), optional=("DINGTALK_SECRET",))
+def send_dingtalk(cfg: dict[str, str], title: str, content: str) -> None:
+    url = cfg["DINGTALK_WEBHOOK"]
+    secret = cfg.get("DINGTALK_SECRET")
+    if secret:
         import base64
+        import hashlib
+        import hmac
+        import time
 
         timestamp = str(round(time.time() * 1000))
-        secret_enc = DINGTALK_SECRET.encode("utf-8")
-        string_to_sign = f"{timestamp}\n{DINGTALK_SECRET}"
+        string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(
-            secret_enc, string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
+            secret.encode("utf-8"), string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
         ).digest()
         sign = base64.b64encode(hmac_code).decode("utf-8")
         url = f"{url}&timestamp={timestamp}&sign={sign}"
 
     payload = {"msgtype": "text", "text": {"content": f"{title}\n\n{content}"}}
-    response = requests.post(url, json=payload, timeout=10)
-    result = response.json()
-
-    if result.get("errcode") == 0:
-        logger.info("钉钉通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("errmsg"))
+    result = _json_or_raise(requests.post(url, json=payload, timeout=REQUEST_TIMEOUT))
+    if result.get("errcode") != 0:
+        raise NotifyError(result.get("errmsg"))
 
 
-@request_retry
-def send_feishu(title: str, content: str) -> bool:
-    """飞书机器人通知"""
-    if not FEISHU_WEBHOOK:
-        logger.debug("未配置 FEISHU_WEBHOOK，跳过")
-        return False
-
-    url = FEISHU_WEBHOOK
-    if FEISHU_SECRET:
-        import time
-        import hmac
-        import hashlib
+@channel("飞书", required=("FEISHU_WEBHOOK",), optional=("FEISHU_SECRET",))
+def send_feishu(cfg: dict[str, str], title: str, content: str) -> None:
+    secret = cfg.get("FEISHU_SECRET")
+    if secret:
         import base64
+        import hashlib
+        import hmac
+        import time
 
         timestamp = str(int(time.time()))
-        string_to_sign = f"{timestamp}\n{FEISHU_SECRET}"
+        string_to_sign = f"{timestamp}\n{secret}"
         hmac_code = hmac.new(
             string_to_sign.encode("utf-8"), digestmod=hashlib.sha256
         ).digest()
@@ -287,288 +227,398 @@ def send_feishu(title: str, content: str) -> bool:
     else:
         payload = {"msg_type": "text", "content": {"text": f"{title}\n\n{content}"}}
 
-    response = requests.post(url, json=payload, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 0:
-        logger.info("飞书通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("msg"))
+    result = _json_or_raise(
+        requests.post(cfg["FEISHU_WEBHOOK"], json=payload, timeout=REQUEST_TIMEOUT)
+    )
+    if result.get("code") != 0:
+        raise NotifyError(result.get("msg"))
 
 
-@request_retry
-def send_gocqhttp(title: str, content: str) -> bool:
-    """go-cqhttp 通知"""
-    if not GOCQHTTP_URL or not GOCQHTTP_TARGET:
-        logger.debug("未配置 go-cqhttp 参数，跳过")
-        return False
-
-    url = f"{GOCQHTTP_URL}/send_private_msg"
+@channel("go-cqhttp", required=("GOCQHTTP_URL", "GOCQHTTP_TARGET"), optional=("GOCQHTTP_TOKEN",))
+def send_gocqhttp(cfg: dict[str, str], title: str, content: str) -> None:
     headers = {}
-    if GOCQHTTP_TOKEN:
-        headers["Authorization"] = f"Bearer {GOCQHTTP_TOKEN}"
+    if cfg.get("GOCQHTTP_TOKEN"):
+        headers["Authorization"] = f"Bearer {cfg['GOCQHTTP_TOKEN']}"
 
-    payload = {"user_id": GOCQHTTP_TARGET, "message": f"{title}\n\n{content}"}
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
-    result = response.json()
-
-    if result.get("status") == "ok":
-        logger.info("go-cqhttp 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("message"))
-
-
-@request_retry
-def send_gotify(title: str, content: str) -> bool:
-    """Gotify 通知"""
-    if not GOTIFY_URL or not GOTIFY_TOKEN:
-        logger.debug("未配置 Gotify 参数，跳过")
-        return False
-
-    url = f"{GOTIFY_URL}/message"
-    headers = {"X-Gotify-Key": GOTIFY_TOKEN}
-    payload = {"title": title, "message": content, "priority": 5}
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
-
-    if response.status_code == 200:
-        logger.info("Gotify 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(response.text)
+    payload = {"user_id": cfg["GOCQHTTP_TARGET"], "message": f"{title}\n\n{content}"}
+    result = _json_or_raise(
+        requests.post(
+            f"{cfg['GOCQHTTP_URL']}/send_private_msg",
+            json=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("status") != "ok":
+        raise NotifyError(result.get("message"))
 
 
-@request_retry
-def send_igot(title: str, content: str) -> bool:
-    """iGot 通知"""
-    if not IGOT_KEY:
-        logger.debug("未配置 IGOT_KEY，跳过")
-        return False
-
-    url = f"https://push.hellyw.com/{IGOT_KEY}"
-    payload = {"title": title, "content": content}
-    response = requests.post(url, json=payload, timeout=10)
-    result = response.json()
-
-    if result.get("ret") == 0:
-        logger.info("iGot 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("errMsg"))
+@channel("Gotify", required=("GOTIFY_URL", "GOTIFY_TOKEN"))
+def send_gotify(cfg: dict[str, str], title: str, content: str) -> None:
+    response = requests.post(
+        f"{cfg['GOTIFY_URL']}/message",
+        json={"title": title, "message": content, "priority": 5},
+        headers={"X-Gotify-Key": cfg["GOTIFY_TOKEN"]},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
 
 
-@request_retry
-def send_pushdeer(title: str, content: str) -> bool:
-    """PushDeer 通知"""
-    if not PUSHDEER_KEY:
-        logger.debug("未配置 PUSHDEER_KEY，跳过")
-        return False
-
-    url = "https://api2.pushdeer.com/message/push"
-    payload = {"pushkey": PUSHDEER_KEY, "text": title, "desp": content, "type": "text"}
-    response = requests.post(url, data=payload, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 0:
-        logger.info("PushDeer 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("error"))
+@channel("iGot", required=("IGOT_KEY",))
+def send_igot(cfg: dict[str, str], title: str, content: str) -> None:
+    result = _json_or_raise(
+        requests.post(
+            f"https://push.hellyw.com/{cfg['IGOT_KEY']}",
+            json={"title": title, "content": content},
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("ret") != 0:
+        raise NotifyError(result.get("errMsg"))
 
 
-@request_retry
-def send_synology_chat(title: str, content: str) -> bool:
-    """Synology Chat 通知"""
-    if not SYNOLOGY_CHAT_URL or not SYNOLOGY_CHAT_TOKEN:
-        logger.debug("未配置 Synology Chat 参数，跳过")
-        return False
+@channel("PushDeer", required=("PUSHDEER_KEY",))
+def send_pushdeer(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {"pushkey": cfg["PUSHDEER_KEY"], "text": title, "desp": content, "type": "text"}
+    result = _json_or_raise(
+        requests.post(
+            "https://api2.pushdeer.com/message/push", data=payload, timeout=REQUEST_TIMEOUT
+        )
+    )
+    if result.get("code") != 0:
+        raise NotifyError(result.get("error"))
 
-    url = f"{SYNOLOGY_CHAT_URL}?api=SYNO.Chat.External&method=incoming&version=2&token={SYNOLOGY_CHAT_TOKEN}"
+
+@channel(
+    "WxPusher",
+    required=("WXPUSHER_APP_TOKEN",),
+    optional=("WXPUSHER_UIDS", "WXPUSHER_TOPIC_IDS"),
+)
+def send_wxpusher(cfg: dict[str, str], title: str, content: str) -> None:
+    uids = split_csv(cfg.get("WXPUSHER_UIDS"))
+    topic_ids = split_csv_int(cfg.get("WXPUSHER_TOPIC_IDS"), "WXPUSHER_TOPIC_IDS")
+    if not uids and not topic_ids:
+        raise NotifyError("WxPusher 需要配置 WXPUSHER_UIDS 或 WXPUSHER_TOPIC_IDS")
+
+    payload: dict[str, object] = {
+        "appToken": cfg["WXPUSHER_APP_TOKEN"],
+        "summary": title[:100],
+        "content": content,
+        "contentType": 1,
+    }
+    if uids:
+        payload["uids"] = uids
+    if topic_ids:
+        payload["topicIds"] = topic_ids
+
+    result = _json_or_raise(
+        requests.post(
+            "https://wxpusher.zjiecode.com/api/send/message",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("code") != 1000:
+        raise NotifyError(result.get("msg") or str(result))
+
+
+@channel("Chanify", required=("CHANIFY_TOKEN",), optional=("CHANIFY_URL",))
+def send_chanify(cfg: dict[str, str], title: str, content: str) -> None:
+    base_url = cfg.get("CHANIFY_URL", "https://api.chanify.net").rstrip("/")
+    response = requests.post(
+        f"{base_url}/v1/sender/{cfg['CHANIFY_TOKEN']}",
+        json={"title": title, "text": content},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
+    if response.headers.get("content-type", "").startswith("application/json"):
+        result = response.json()
+        if result.get("res", 0) != 0:
+            raise NotifyError(result.get("msg") or str(result))
+
+
+@channel("Synology Chat", required=("SYNOLOGY_CHAT_URL", "SYNOLOGY_CHAT_TOKEN"))
+def send_synology_chat(cfg: dict[str, str], title: str, content: str) -> None:
+    url = (
+        f"{cfg['SYNOLOGY_CHAT_URL']}?api=SYNO.Chat.External&method=incoming"
+        f"&version=2&token={cfg['SYNOLOGY_CHAT_TOKEN']}"
+    )
     payload = {"payload": json.dumps({"text": f"{title}\n\n{content}"})}
-    response = requests.post(url, data=payload, timeout=10)
-    result = response.json()
-
-    if result.get("success"):
-        logger.info("Synology Chat 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(str(result))
+    result = _json_or_raise(requests.post(url, data=payload, timeout=REQUEST_TIMEOUT))
+    if not result.get("success"):
+        raise NotifyError(str(result))
 
 
-@request_retry
-def send_pushplus(title: str, content: str) -> bool:
-    """PushPlus 通知"""
-    if not PUSHPLUS_TOKEN:
-        logger.debug("未配置 PUSHPLUS_TOKEN，跳过")
-        return False
-
-    url = "https://www.pushplus.plus/send"
-    payload = {"token": PUSHPLUS_TOKEN, "title": title, "content": content}
-    response = requests.post(url, json=payload, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 200:
-        logger.info("PushPlus 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("msg"))
+@channel("PushPlus", required=("PUSHPLUS_TOKEN",))
+def send_pushplus(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {"token": cfg["PUSHPLUS_TOKEN"], "title": title, "content": content}
+    result = _json_or_raise(
+        requests.post("https://www.pushplus.plus/send", json=payload, timeout=REQUEST_TIMEOUT)
+    )
+    if result.get("code") != 200:
+        raise NotifyError(result.get("msg"))
 
 
-@request_retry
-def send_wecom(title: str, content: str) -> bool:
-    """企业微信通知"""
-    if not all([WECOM_CORP_ID, WECOM_AGENT_ID, WECOM_SECRET]):
-        logger.debug("企业微信配置不完整，跳过")
-        return False
-
-    # 获取 access_token
-    token_url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_SECRET}"
-    token_response = requests.get(token_url, timeout=10)
-    token_result = token_response.json()
-
+@channel(
+    "企业微信",
+    required=("WECOM_CORP_ID", "WECOM_AGENT_ID", "WECOM_SECRET"),
+    optional=("WECOM_TOUSER",),
+)
+def send_wecom(cfg: dict[str, str], title: str, content: str) -> None:
+    token_result = _json_or_raise(
+        requests.get(
+            "https://qyapi.weixin.qq.com/cgi-bin/gettoken"
+            f"?corpid={cfg['WECOM_CORP_ID']}&corpsecret={cfg['WECOM_SECRET']}",
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
     if token_result.get("errcode") != 0:
-        raise requests.exceptions.RequestException(token_result.get("errmsg"))
+        raise NotifyError(token_result.get("errmsg"))
 
-    access_token = token_result["access_token"]
-
-    # 发送消息
-    send_url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={access_token}"
     payload = {
-        "touser": WECOM_TOUSER or "@all",
+        "touser": cfg.get("WECOM_TOUSER", "@all"),
         "msgtype": "text",
-        "agentid": WECOM_AGENT_ID,
+        "agentid": cfg["WECOM_AGENT_ID"],
         "text": {"content": f"{title}\n\n{content}"},
     }
-    response = requests.post(send_url, json=payload, timeout=10)
-    result = response.json()
+    result = _json_or_raise(
+        requests.post(
+            "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+            f"?access_token={token_result['access_token']}",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("errcode") != 0:
+        raise NotifyError(result.get("errmsg"))
 
-    if result.get("errcode") == 0:
-        logger.info("企业微信通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("errmsg"))
+
+@channel("企业微信群机器人", required=("WECOM_BOT_WEBHOOK",))
+def send_wecom_bot(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {"msgtype": "text", "text": {"content": f"{title}\n\n{content}"}}
+    result = _json_or_raise(
+        requests.post(cfg["WECOM_BOT_WEBHOOK"], json=payload, timeout=REQUEST_TIMEOUT)
+    )
+    if result.get("errcode") != 0:
+        raise NotifyError(result.get("errmsg"))
 
 
-@request_retry
-def send_qmsg(title: str, content: str) -> bool:
-    """Qmsg酱 通知"""
-    if not QMSG_KEY:
-        logger.debug("未配置 QMSG_KEY，跳过")
-        return False
-
-    url = f"https://qmsg.zendee.cn/send/{QMSG_KEY}"
+@channel("Qmsg酱", required=("QMSG_KEY",), optional=("QMSG_QQ",))
+def send_qmsg(cfg: dict[str, str], title: str, content: str) -> None:
     payload = {"msg": f"{title}\n\n{content}"}
-    if QMSG_QQ:
-        payload["qq"] = QMSG_QQ
+    if cfg.get("QMSG_QQ"):
+        payload["qq"] = cfg["QMSG_QQ"]
 
-    response = requests.post(url, data=payload, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 0:
-        logger.info("Qmsg酱 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("reason"))
-
-
-@request_retry
-def send_aibotk(title: str, content: str) -> bool:
-    """智能微秘书 (Aibotk) 通知"""
-    if not AIBOTK_KEY or not AIBOTK_TARGET:
-        logger.debug("未配置智能微秘书参数，跳过")
-        return False
-
-    url = "https://api-bot.aibotk.com/openapi/v1/chat/send"
-    headers = {"Authorization": f"Bearer {AIBOTK_KEY}"}
-    payload = {"to": AIBOTK_TARGET, "type": 1, "content": f"{title}\n\n{content}"}
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
-    result = response.json()
-
-    if result.get("code") == 0:
-        logger.info("智能微秘书通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(result.get("message"))
+    result = _json_or_raise(
+        requests.post(
+            f"https://qmsg.zendee.cn/send/{cfg['QMSG_KEY']}", data=payload, timeout=REQUEST_TIMEOUT
+        )
+    )
+    if result.get("code") != 0:
+        raise NotifyError(result.get("reason"))
 
 
-@request_retry
-def send_pushme(title: str, content: str) -> bool:
-    """PushMe 通知"""
-    if not PUSHME_KEY:
-        logger.debug("未配置 PUSHME_KEY，跳过")
-        return False
-
-    url = "https://push.i-i.me/"
-    payload = {"push_key": PUSHME_KEY, "title": title, "content": content}
-    response = requests.post(url, data=payload, timeout=10)
-
-    if response.text == "success":
-        logger.info("PushMe 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(response.text)
+@channel("智能微秘书", required=("AIBOTK_KEY", "AIBOTK_TARGET"))
+def send_aibotk(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {"to": cfg["AIBOTK_TARGET"], "type": 1, "content": f"{title}\n\n{content}"}
+    result = _json_or_raise(
+        requests.post(
+            "https://api-bot.aibotk.com/openapi/v1/chat/send",
+            json=payload,
+            headers={"Authorization": f"Bearer {cfg['AIBOTK_KEY']}"},
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("code") != 0:
+        raise NotifyError(result.get("message"))
 
 
-@request_retry
-def send_chronocat(title: str, content: str) -> bool:
-    """Chronocat 通知"""
-    if not CHRONOCAT_URL or not CHRONOCAT_TARGET:
-        logger.debug("未配置 Chronocat 参数，跳过")
-        return False
+@channel("PushMe", required=("PUSHME_KEY",))
+def send_pushme(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {"push_key": cfg["PUSHME_KEY"], "title": title, "content": content}
+    response = requests.post("https://push.i-i.me/", data=payload, timeout=REQUEST_TIMEOUT)
+    if response.text != "success":
+        raise NotifyError(response.text)
 
-    url = f"{CHRONOCAT_URL}/api/message/send"
+
+@channel(
+    "Pushover",
+    required=("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"),
+    optional=(
+        "PUSHOVER_DEVICE",
+        "PUSHOVER_PRIORITY",
+        "PUSHOVER_SOUND",
+        "PUSHOVER_URL",
+        "PUSHOVER_URL_TITLE",
+        "PUSHOVER_RETRY",
+        "PUSHOVER_EXPIRE",
+    ),
+)
+def send_pushover(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {
+        "token": cfg["PUSHOVER_APP_TOKEN"],
+        "user": cfg["PUSHOVER_USER_KEY"],
+        "title": title[:250],
+        "message": content,
+    }
+    optional_fields = {
+        "PUSHOVER_DEVICE": "device",
+        "PUSHOVER_PRIORITY": "priority",
+        "PUSHOVER_SOUND": "sound",
+        "PUSHOVER_URL": "url",
+        "PUSHOVER_URL_TITLE": "url_title",
+        "PUSHOVER_RETRY": "retry",
+        "PUSHOVER_EXPIRE": "expire",
+    }
+    for env_name, payload_name in optional_fields.items():
+        if cfg.get(env_name):
+            payload[payload_name] = cfg[env_name]
+
+    result = _json_or_raise(
+        requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+    )
+    if result.get("status") != 1:
+        errors = result.get("errors")
+        if isinstance(errors, list):
+            raise NotifyError("; ".join(str(item) for item in errors))
+        raise NotifyError(result.get("message") or str(result))
+
+
+@channel("Chronocat", required=("CHRONOCAT_URL", "CHRONOCAT_TARGET"), optional=("CHRONOCAT_TOKEN",))
+def send_chronocat(cfg: dict[str, str], title: str, content: str) -> None:
     headers = {"Content-Type": "application/json"}
-    if CHRONOCAT_TOKEN:
-        headers["Authorization"] = f"Bearer {CHRONOCAT_TOKEN}"
+    if cfg.get("CHRONOCAT_TOKEN"):
+        headers["Authorization"] = f"Bearer {cfg['CHRONOCAT_TOKEN']}"
 
     payload = {
-        "peer": {"chatType": 1, "peerUin": CHRONOCAT_TARGET},
+        "peer": {"chatType": 1, "peerUin": cfg["CHRONOCAT_TARGET"]},
         "elements": [{"elementType": 1, "textElement": {"content": f"{title}\n\n{content}"}}],
     }
-    response = requests.post(url, json=payload, headers=headers, timeout=10)
+    response = requests.post(
+        f"{cfg['CHRONOCAT_URL']}/api/message/send",
+        json=payload,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
 
-    if response.status_code == 200:
-        logger.info("Chronocat 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(response.text)
 
-
-@request_retry
-def send_ntfy(title: str, content: str) -> bool:
-    """ntfy 通知"""
-    if not NTFY_TOPIC:
-        logger.debug("未配置 NTFY_TOPIC，跳过")
-        return False
-
-    base_url = NTFY_URL or "https://ntfy.sh"
-    url = f"{base_url}/{NTFY_TOPIC}"
+@channel("ntfy", required=("NTFY_TOPIC",), optional=("NTFY_URL", "NTFY_TOKEN"))
+def send_ntfy(cfg: dict[str, str], title: str, content: str) -> None:
+    base_url = cfg.get("NTFY_URL", "https://ntfy.sh")
     headers = {"Title": title}
-    if NTFY_TOKEN:
-        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    if cfg.get("NTFY_TOKEN"):
+        headers["Authorization"] = f"Bearer {cfg['NTFY_TOKEN']}"
 
-    response = requests.post(url, data=content.encode("utf-8"), headers=headers, timeout=10)
+    response = requests.post(
+        f"{base_url}/{cfg['NTFY_TOPIC']}",
+        data=content.encode("utf-8"),
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
 
-    if response.status_code == 200:
-        logger.info("ntfy 通知发送成功")
-        return True
-    else:
-        raise requests.exceptions.RequestException(response.text)
+
+@channel("Discord", required=("DISCORD_WEBHOOK",))
+def send_discord(cfg: dict[str, str], title: str, content: str) -> None:
+    response = requests.post(
+        cfg["DISCORD_WEBHOOK"],
+        json={"content": f"**{title}**\n\n{content}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code not in (200, 204):
+        raise NotifyError(response.text)
 
 
-@request_retry
-def send_webhook(title: str, content: str) -> bool:
-    """自定义 Webhook 通知"""
-    if not WEBHOOK_URL:
-        logger.debug("未配置 WEBHOOK_URL，跳过")
-        return False
+@channel("Slack", required=("SLACK_WEBHOOK",))
+def send_slack(cfg: dict[str, str], title: str, content: str) -> None:
+    response = requests.post(
+        cfg["SLACK_WEBHOOK"],
+        json={"text": f"*{title}*\n\n{content}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
+    body = response.text.strip().lower()
+    if body and body != "ok":
+        raise NotifyError(response.text)
 
-    method = (WEBHOOK_METHOD or "POST").upper()
-    headers = json.loads(WEBHOOK_HEADERS) if WEBHOOK_HEADERS else {}
 
-    if WEBHOOK_BODY_TEMPLATE:
-        body = WEBHOOK_BODY_TEMPLATE.replace("{{title}}", title).replace(
+@channel("Microsoft Teams", required=("TEAMS_WEBHOOK",))
+def send_teams(cfg: dict[str, str], title: str, content: str) -> None:
+    payload = {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": title,
+        "themeColor": "0078D4",
+        "title": title,
+        "text": content.replace("\n", "\n\n"),
+    }
+    response = requests.post(cfg["TEAMS_WEBHOOK"], json=payload, timeout=REQUEST_TIMEOUT)
+    if response.status_code not in (200, 202):
+        raise NotifyError(response.text)
+
+
+@channel(
+    "Matrix",
+    required=("MATRIX_HOMESERVER", "MATRIX_ACCESS_TOKEN", "MATRIX_ROOM_ID"),
+    optional=("MATRIX_MSGTYPE",),
+)
+def send_matrix(cfg: dict[str, str], title: str, content: str) -> None:
+    homeserver = cfg["MATRIX_HOMESERVER"].rstrip("/")
+    room_id = quote(cfg["MATRIX_ROOM_ID"], safe="")
+    txn_id = uuid4().hex
+    msgtype = cfg.get("MATRIX_MSGTYPE", "m.text")
+    payload = {"msgtype": msgtype, "body": f"{title}\n\n{content}"}
+    response = requests.put(
+        f"{homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}",
+        json=payload,
+        headers={"Authorization": f"Bearer {cfg['MATRIX_ACCESS_TOKEN']}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    result = _json_or_raise(response)
+    if response.status_code != 200 or not result.get("event_id"):
+        raise NotifyError(result.get("errcode") or result.get("error") or response.text)
+
+
+@channel("息知", required=("XIZHI_TOKEN",), optional=("XIZHI_URL",))
+def send_xizhi(cfg: dict[str, str], title: str, content: str) -> None:
+    base_url = cfg.get("XIZHI_URL", "https://xizhi.qqoq.net").rstrip("/")
+    response = requests.post(
+        f"{base_url}/{cfg['XIZHI_TOKEN']}.send",
+        data={"title": title, "content": content},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise NotifyError(response.text)
+    try:
+        result = response.json()
+    except ValueError:
+        return
+    code = result.get("code")
+    if code not in (0, 200, "0", "200", None):
+        raise NotifyError(result.get("msg") or result.get("message") or str(result))
+
+
+@channel(
+    "Webhook",
+    required=("WEBHOOK_URL",),
+    optional=("WEBHOOK_METHOD", "WEBHOOK_HEADERS", "WEBHOOK_BODY_TEMPLATE"),
+)
+def send_webhook(cfg: dict[str, str], title: str, content: str) -> None:
+    method = cfg.get("WEBHOOK_METHOD", "POST").upper()
+    headers = json.loads(cfg["WEBHOOK_HEADERS"]) if cfg.get("WEBHOOK_HEADERS") else {}
+
+    if cfg.get("WEBHOOK_BODY_TEMPLATE"):
+        body = cfg["WEBHOOK_BODY_TEMPLATE"].replace("{{title}}", title).replace(
             "{{content}}", content
         )
         data = json.loads(body)
@@ -576,97 +626,122 @@ def send_webhook(title: str, content: str) -> bool:
         data = {"title": title, "content": content}
 
     if method == "GET":
-        response = requests.get(WEBHOOK_URL, params=data, headers=headers, timeout=10)
+        response = requests.get(
+            cfg["WEBHOOK_URL"], params=data, headers=headers, timeout=REQUEST_TIMEOUT
+        )
     else:
-        response = requests.post(WEBHOOK_URL, json=data, headers=headers, timeout=10)
+        response = requests.post(
+            cfg["WEBHOOK_URL"], json=data, headers=headers, timeout=REQUEST_TIMEOUT
+        )
 
-    if response.status_code in [200, 201, 204]:
-        logger.info("Webhook 通知发送成功")
+    if response.status_code not in (200, 201, 204):
+        raise NotifyError(response.text)
+
+
+# 调度入口
+
+
+def get_status(balance: float) -> str:
+    """返回电量状态文案。"""
+    if balance > EXCELLENT_THRESHOLD:
+        return "充足"
+    elif balance > THRESHOLD:
+        return "偏低"
+    else:
+        return "不足"
+
+
+def format_balance_report(light_balance: float, ac_balance: float) -> str:
+    """格式化电量报告。"""
+    return (
+        f"💡 照明剩余电量：{light_balance} 度（{get_status(light_balance)}）\n"
+        f"❄️ 空调剩余电量：{ac_balance} 度（{get_status(ac_balance)}）\n\n"
+    )
+
+
+def is_low_energy(balances: dict[str, float]) -> bool:
+    """判断是否触发低电量报警。"""
+    return balances["light_Balance"] <= THRESHOLD or balances["ac_Balance"] <= THRESHOLD
+
+
+def build_low_energy_state(balances: dict[str, float]) -> dict[str, bool]:
+    """生成低电量去重状态。"""
+    return {
+        "light_low": balances["light_Balance"] <= THRESHOLD,
+        "ac_low": balances["ac_Balance"] <= THRESHOLD,
+    }
+
+
+def should_send_low_energy_alert(balances: dict[str, float]) -> bool:
+    """判断是否应发送本次低电量报警。"""
+    if not get_settings().notify_dedup:
         return True
-    else:
-        raise requests.exceptions.RequestException(response.text)
+
+    current_state = build_low_energy_state(balances)
+    previous_state = load_notify_state()
+    previous_low_state = previous_state.get("low_energy")
+
+    if previous_low_state == current_state:
+        logger.info("低电量状态未变化，已按 NOTIFY_DEDUP 跳过重复报警")
+        return False
+
+    return True
 
 
-# ==================== 通知调度 ====================
+def update_notify_state(balances: dict[str, float]) -> None:
+    """按当前电量更新通知去重状态。"""
+    if not get_settings().notify_dedup:
+        return
 
-# 所有通知渠道 (除 Telegram 外)
-ALERT_CHANNELS: list[tuple[str, Callable[[str, str], bool]]] = [
-    ("Server酱", send_serverchan),
-    ("邮件", send_email),
-    ("Bark", send_bark),
-    ("钉钉", send_dingtalk),
-    ("飞书", send_feishu),
-    ("go-cqhttp", send_gocqhttp),
-    ("Gotify", send_gotify),
-    ("iGot", send_igot),
-    ("PushDeer", send_pushdeer),
-    ("Synology Chat", send_synology_chat),
-    ("PushPlus", send_pushplus),
-    ("企业微信", send_wecom),
-    ("Qmsg酱", send_qmsg),
-    ("智能微秘书", send_aibotk),
-    ("PushMe", send_pushme),
-    ("Chronocat", send_chronocat),
-    ("ntfy", send_ntfy),
-    ("Webhook", send_webhook),
-]
+    save_notify_state(
+        {
+            "low_energy": build_low_energy_state(balances),
+            "updated_at": get_cst_time(),
+        }
+    )
 
 
-def send_alert(title: str, content: str) -> None:
-    """
-    发送报警通知 - 发送到所有渠道
-
-    Args:
-        title: 通知标题
-        content: 通知内容 (普通文本格式)
-    """
-    logger.info("发送报警通知到所有渠道...")
-
-    # Telegram (使用 Markdown 转义)
-    try:
-        telegram_content = content.replace(".", "\\.")
-        send_telegram(title, telegram_content)
-    except Exception as e:
-        logger.error(f"Telegram 通知失败: {e}")
-
-    # 其他渠道
-    for name, func in ALERT_CHANNELS:
+def _dispatch_channels(channels: list[Channel], title: str, content: str) -> int:
+    """逐渠道发送通知。"""
+    sent_count = 0
+    for ch in channels:
         try:
-            func(title, content)
+            if dispatch(ch, title, content):
+                sent_count += 1
         except Exception as e:
-            logger.error(f"{name} 通知失败: {e}")
+            logger.error(f"{ch.name} 通知失败: {e}")
+    return sent_count
 
 
-def send_daily(title: str, content: str) -> None:
-    """
-    发送日常通知 - 仅发送到 Telegram
-
-    Args:
-        title: 通知标题
-        content: 通知内容 (普通文本格式)
-    """
-    logger.info("发送日常通知到 Telegram...")
-    try:
-        telegram_content = content.replace(".", "\\.")
-        send_telegram(title, telegram_content)
-    except Exception as e:
-        logger.error(f"Telegram 通知失败: {e}")
+def send_alert(title: str, content: str) -> int:
+    """向所有已配置渠道发送报警通知。"""
+    logger.info("发送报警通知到所有渠道...")
+    return _dispatch_channels(list(CHANNELS.values()), title, content)
 
 
-def notify(balances: Dict[str, float]) -> None:
-    """
-    根据电量状态发送通知
+def send_daily(title: str, content: str) -> int:
+    """向日常渠道（Telegram）发送通知。"""
+    logger.info("发送日常通知...")
+    return _dispatch_channels([ch for ch in CHANNELS.values() if ch.daily], title, content)
 
-    Args:
-        balances: 电量数据 {"light_Balance": float, "ac_Balance": float}
-    """
+
+def notify(balances: dict[str, float]) -> None:
+    """根据电量状态发送通知。"""
     low_energy = is_low_energy(balances)
     title = "⚠️宿舍电量预警⚠️" if low_energy else "🏠宿舍电量通报🏠"
     content = format_balance_report(balances["light_Balance"], balances["ac_Balance"])
 
     if low_energy:
         content += "⚠️ 电量不足，请尽快充电！"
-        send_alert(title, content)
+        if should_send_low_energy_alert(balances):
+            sent_count = send_alert(title, content)
+            if sent_count:
+                update_notify_state(balances)
+            else:
+                logger.warning("低电量报警未成功发送到任何渠道，保留旧去重状态")
+        else:
+            update_notify_state(balances)
     else:
         content += "当前电量充足，请保持关注。"
         send_daily(title, content)
+        update_notify_state(balances)
